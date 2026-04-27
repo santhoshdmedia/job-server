@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+     <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>Order Tracking</title>
+     <style>
+          body {
+               font-family: Arial, sans-serif;
+               background-color: #f4f4f4;
+               margin: 0;
+               padding: 0;
+          }
+
+          .container {
+               max-width: 600px;
+               margin: 50px auto;
+               background: #fff;
+               padding: 20px;
+               text-align: center;
+               border-radius: 10px;
+               box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+          }
+
+          .header {
+               font-size: 24px;
+               font-weight: bold;
+               color: #333;
+               background-color: hotpink;
+               padding: 10px;
+               border-radius: 5px;
+          }
+
+          .header .e {
+               color: #396ec4;
+          }
+
+          .thrilled {
+               font-size: 16px;
+               color: #666;
+               margin: 20px 0;
+               font-weight: bold;
+          }
+
+          .status-container {
+               font-size: 40px;
+               margin: 15px 0;
+          }
+
+          .status {
+               font-size: 18px;
+               font-weight: bold;
+               color: #28a745;
+               margin-top: 10px;
+          }
+
+          .buttonorder {
+               display: inline-block;
+               background: #28a745;
+               color: #fff;
+               padding: 10px 20px;
+               text-decoration: none;
+               font-size: 16px;
+               border-radius: 5px;
+               margin-top: 20px;
+          }
+
+          .buttonorder:hover {
+               background: #218838;
+          }
+
+          .contact {
+               font-size: 14px;
+               color: #333;
+               margin-top: 20px;
+          }
+     </style>
+</head>
+
+<body>
+     <div class="container">
+          <div class="header">PRINT <span class="e">E</span></div>
+          <p class="thrilled">We are thrilled 😄 to inform you that your order has been processed and is on its way.</p>
+          <div class="status-container">🚚</div>
+          <div class="status">
+               <%= order_status %>
+          </div>
+          <a href="https://www.printe.in/account/my-orders" class="buttonorder">Track Order →</a>
+          <p class="contact">If you have any questions, feel free to <b>contact us</b>.</p>
+     </div>
+</body>
+
+</html>

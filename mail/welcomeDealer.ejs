@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Account Verified - Printe Dealer Portal</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f6f8;
+            font-family: 'Arial', sans-serif;
+        }
+        .container {
+            max-width: 780px;
+            margin: 30px auto;
+            background: #ffffff;
+            border-radius: 14px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+            border: 2px solid;
+        }
+        .header {
+            background: linear-gradient(135deg, #4CAF50, #2E7D32);
+            padding: 40px 20px;
+            text-align: center;
+        }
+        .logo {
+            max-width: 180px;
+            margin-bottom: 15px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 30px;
+            color: white;
+        }
+        .header p {
+            margin-top: 10px;
+            color: #e8f5e9;
+            font-size: 16px;
+        }
+        .content {
+            padding: 40px;
+        }
+        .greeting {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 15px;
+        }
+        .message {
+            font-size: 16px;
+            color: #555;
+            line-height: 1.8;
+            margin-bottom: 30px;
+        }
+        .success-box {
+            background: #e8f5e9;
+            border-left: 6px solid #4CAF50;
+            padding: 25px;
+            border-radius: 8px;
+            margin-bottom: 35px;
+            text-align: center;
+        }
+        .success-box h3 {
+            margin-top: 0;
+            color: #2E7D32;
+            font-size: 22px;
+        }
+        .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        .cta-btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #4CAF50, #2E7D32);
+            color: white !important;
+            text-decoration: none;
+            font-size: 18px;
+            font-weight: bold;
+            padding: 18px 45px;
+            border-radius: 10px;
+            box-shadow: 0 6px 20px rgba(76, 175, 80, 0.4);
+            margin: 20px 0;
+        }
+        .cta-btn:hover {
+            background: linear-gradient(135deg, #43A047, #1B5E20);
+        }
+        .benefits {
+            margin-top: 30px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 25px;
+        }
+        .benefits h3 {
+            color: #333;
+            margin-top: 0;
+            margin-bottom: 20px;
+        }
+        .benefit-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+            padding: 12px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }
+        .benefit-icon {
+            font-size: 24px;
+            margin-right: 15px;
+            color: #4CAF50;
+            min-width: 30px;
+        }
+        .benefit-text {
+            color: #555;
+        }
+        .dashboard-link {
+            margin-top: 20px;
+            background: #f4f6f8;
+            border: 1px dashed #ccc;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 14px;
+            word-break: break-all;
+            color: #666;
+            text-align: center;
+        }
+        .security-note {
+            margin-top: 35px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            font-size: 14px;
+            color: #777;
+        }
+        .footer {
+            background: #f4f6f8;
+            padding: 25px 40px;
+            text-align: center;
+            font-size: 13px;
+            color: #888;
+        }
+        .footer strong {
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- Header -->
+    <div class="header">
+        <img   fetchpriority="high" loading="eager" src="https://printe.in/assets/without_bg-B7FPZzwZ.png" class="logo" alt="Printe">
+        <h1>Account Verified Successfully! ✅</h1>
+        <p>Welcome to the Printe Dealer Network</p>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+        <div class="greeting">
+            Congratulations <%= name %>,
+        </div>
+
+        <div class="message">
+            Your <strong>Printe Dealer Account</strong> has been successfully verified and activated.
+            You can now access all dealer benefits and start growing your business with our multi-vendor platform.
+        </div>
+
+        <!-- Success Box -->
+        <div class="success-box">
+            <div class="icon">🎉</div>
+            <h3>Your Account is Ready to Use!</h3>
+            <p>Start exploring dealer-exclusive features and benefits immediately.</p>
+            
+            <div style="text-align:center;">
+                <a href="<%= dashboardUrl %>" class="cta-btn">
+                    GO TO DEALER DASHBOARD
+                </a>
+            </div>
+
+            <p style="font-size:14px; text-align:center; color:#666;">
+                Direct dashboard link:
+            </p>
+
+            <div class="dashboard-link">
+                <%= dashboardUrl %>
+            </div>
+        </div>
+
+        <!-- Benefits Section -->
+        <div class="benefits">
+            <h3>🌟 Your Dealer Benefits</h3>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">📦</div>
+                <div class="benefit-text">
+                    <strong>Access to Multiple Vendors</strong> - Source products from hundreds of verified suppliers
+                </div>
+            </div>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">💰</div>
+                <div class="benefit-text">
+                    <strong>Competitive Commission Rates</strong> - Earn generous margins on every sale
+                </div>
+            </div>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">🚚</div>
+                <div class="benefit-text">
+                    <strong>Streamlined Order Management</strong> - Track and manage orders from one dashboard
+                </div>
+            </div>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">📊</div>
+                <div class="benefit-text">
+                    <strong>Real-time Analytics</strong> - Monitor sales performance and customer insights
+                </div>
+            </div>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">🎁</div>
+                <div class="benefit-text">
+                    <strong>Exclusive Dealer Promotions</strong> - Special deals and early access to new products
+                </div>
+            </div>
+            
+            <div class="benefit-item">
+                <div class="benefit-icon">📞</div>
+                <div class="benefit-text">
+                    <strong>Priority Support</strong> - Dedicated dealer support team
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick Start Tips -->
+        <div style="margin-top: 35px;">
+            <h3>🚀 Quick Start Guide</h3>
+            <ul style="color: #555; line-height: 1.8;">
+                <li><strong>Complete your dealer profile</strong> - Add business details for better visibility</li>
+                <li><strong>Browse vendor catalog</strong> - Explore products from our network</li>
+                <li><strong>Set up payment method</strong> - Configure your preferred payout method</li>
+                <li><strong>Connect your sales channels</strong> - Link your online stores or marketplaces</li>
+                <li><strong>Join dealer community</strong> - Network with other dealers in our forum</li>
+            </ul>
+        </div>
+
+        <!-- Security -->
+        <div class="security-note">
+            <strong>🔒 Account Security:</strong><br>
+            Your account is now active. For security, always use strong passwords and enable two-factor authentication in your account settings.
+        </div>
+    </div>
+
+    jun 13 2024
+    <!-- Footer -->
+    <div class="footer">
+        <strong>Printe Dealer Success Team</strong><br>
+        Empowering Dealers with Smart Multi-Vendor Solutions<br><br>
+        Need help? Visit our <a href="<%= helpCenterUrl %>" style="color: #4CAF50;">Dealer Help Center</a><br><br>
+        © 2026 Printe. All rights reserved.<br>
+        This is an automated email. Please do not reply.
+    </div>
+</div>
+</body>
+</html>

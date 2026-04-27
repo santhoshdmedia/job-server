@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Welcome to Printe - BNI Member</title>
+  <!--[if mso]>
+      <style type="text/css">
+        body,
+        table,
+        td {
+          font-family: Arial, sans-serif !important;
+        }
+      </style>
+    <![endif]-->
+  <style type="text/css">
+    @import url("https://fonts.googleapis.com/css2?family=Playwrite+US+Trad:wght@100..400&family=Lexend+Deca:wght@300;400;500;600;700&family=Poetsen+One&display=swap");
+
+    /* Reset styles */
+    body {
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      -webkit-text-size-adjust: 100%;
+      -ms-text-size-adjust: 100%;
+    }
+
+    table {
+      border-spacing: 0;
+      border-collapse: collapse;
+      mso-table-lspace: 0pt;
+      mso-table-rspace: 0pt;
+    }
+
+    img {
+      border: 0;
+      outline: none;
+      text-decoration: none;
+      -ms-interpolation-mode: bicubic;
+      display: block;
+    }
+
+    /* Font fallbacks for email clients that don't support Google Fonts */
+    .playwrite-font {
+      font-family: "Playwrite US Trad", "Comic Sans MS", cursive, Arial, sans-serif;
+    }
+
+    .lexend-font {
+      font-family: "Lexend Deca", Arial, Helvetica, sans-serif;
+      color: #1a1a1a !important;
+    }
+
+    .poetsen-font {
+      font-family: "Poetsen One", "Arial Black", Arial, sans-serif;
+    }
+
+    .back-text {
+      padding: 0.5rem !important;
+    }
+
+    .sec_two {
+      height: 600px !important;
+    }
+
+    /* Footer styles */
+    .footer-section {
+      background: linear-gradient(135deg, #FFF9E6 0%, #FFE8B3 100%);
+      padding: 20px;
+    }
+
+    .footer-table {
+      width: 100%;
+      max-width: 100%;
+    }
+
+    .logo-cell {
+      width: 180px;
+      vertical-align: middle;
+      padding-right: 20px;
+    }
+
+    .logo-img {
+      height: 50px;
+      width: auto;
+      display: block;
+    }
+
+    .social-cell {
+      text-align: center;
+      vertical-align: middle;
+      padding: 0 15px;
+    }
+
+    .social-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #000000;
+      margin-bottom: 10px;
+      text-align: center;
+    }
+
+    .social-icons {
+      text-align: center;
+    }
+
+    .social-icon {
+      display: inline-block;
+      margin: 0 5px;
+      vertical-align: middle;
+    }
+
+    .social-icon img {
+      width: 32px;
+      height: 32px;
+      display: inline-block;
+    }
+
+    .contact-cell {
+      text-align: right;
+      vertical-align: middle;
+      width: 220px;
+      padding-left: 50px;
+    }
+
+    .contact-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #000000;
+      margin-bottom: 8px;
+    }
+
+    .contact-info {
+      font-size: 12px;
+      color: #333333;
+      line-height: 1.8;
+      font-weight: 600;
+    }
+
+    .contact-info a {
+      color: #333333;
+      font-weight: 600;
+      text-decoration: none;
+    }
+
+    @media screen and (min-width: 320px) and (max-width: 991px) {
+      .back-text {
+        padding: 2rem !important;
+      }
+    }
+
+    /* Responsive */
+    @media only screen and (max-width: 600px) {
+      .container {
+        width: 100% !important;
+      }
+
+      .lexend-font {
+        font-family: "Lexend Deca", Arial, Helvetica, sans-serif;
+        color: #1a1a1a !important;
+      }
+
+      /* Responsive heading sizes - MOBILE OPTIMIZED */
+      .trending-heading {
+        font-size: 10px !important;
+      }
+
+      .trending-subheading {
+        font-size: 12px !important;
+        line-height: 16px !important;
+      }
+
+      .trending-padding-top {
+        padding: 20px 15px 8px 15px !important;
+      }
+
+      .trending-padding-bottom {
+        padding: 0 15px 20px 15px !important;
+      }
+
+      .mobile-padding {
+        padding: 20px !important;
+      }
+
+      .mobile-text-center {
+        text-align: center !important;
+      }
+
+      .hide-mobile {
+        display: none !important;
+      }
+
+      .mobile-block {
+        display: block !important;
+        width: 100% !important;
+      }
+
+      /* Footer responsive styles - Keep horizontal but smaller */
+      .footer-section {
+        padding: 10px 5px !important;
+      }
+
+      .footer-table {
+        width: 100% !important;
+      }
+
+      .logo-cell {
+        width: 80px !important;
+        padding-right: 5px !important;
+      }
+
+      .logo-img {
+        height: 30px !important;
+      }
+
+      .social-cell {
+        padding: 0 5px !important;
+      }
+
+      .social-title {
+        font-size: 9px !important;
+        margin-bottom: 5px !important;
+      }
+
+      .social-icon {
+        margin: 0 2px !important;
+      }
+
+      .social-icon img {
+        width: 20px !important;
+        height: 20px !important;
+      }
+
+      .contact-cell {
+        width: 140px !important;
+        padding-left: 5px !important;
+      }
+
+      .contact-title {
+        font-size: 9px !important;
+        margin-bottom: 3px !important;
+      }
+
+      .contact-info {
+        font-size: 8px !important;
+        line-height: 1.4 !important;
+      }
+    }
+
+    /* Medium screen responsive */
+    @media only screen and (min-width: 601px) and (max-width: 800px) {
+      .trending-heading {
+        font-size: 10px !important;
+      }
+
+      .trending-subheading {
+        font-size: 15px !important;
+      }
+    }
+  </style>
+</head>
+
+<body style="margin: 0; padding: 0;">
+  <!-- Main Container -->
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+    style="background-color: #fff8e8">
+    <tr>
+      <td style="padding: 0">
+        <!-- Email Content Table (800px wide for email compatibility) -->
+        <table role="presentation" class="container" cellspacing="0" cellpadding="0" border="0" align="center"
+          style="max-width: 800px; background-color: #fff8e8; margin: 0 auto">
+
+          <!-- SECTION 1: Hero Section with Logo and Gift Set -->
+          <tr>
+            <td>
+              <a href="https://printe.in/">
+                <img   fetchpriority="high" loading="eager" src="https://printe.s3.ap-south-1.amazonaws.com/1769851842513-7or0rmowieh.jpeg" alt=""
+                  style="width: 100%; height: auto;" />
+              </a>
+            </td>
+          </tr>
+
+          <!-- SECTION 2: Trending Products with background image -->
+          <tr>
+            <td style="padding: 0">
+              <!-- Container with background image -->
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="
+                    background-image: url(&quot;https://printe.s3.ap-south-1.amazonaws.com/1769583817697-3mo1yul8svs.jpeg&quot;);
+                    background-size: cover;
+                    background-position: center;
+                    background-repeat: no-repeat;
+                    width: 100%;
+                    height: auto;
+                  ">
+
+                <tr style="height: 100px;"></tr>
+                <tr>
+                  <td align="center" class="back-text">
+                    <!-- Products Container -->
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="
+                          max-width: 100%;
+                          margin: 0 auto;
+                        ">
+                      <tr>
+                        <!-- Product 1 -->
+                        <td align="center" valign="top" width="200" style="padding: 0 5px">
+                          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <tr>
+                              <td>
+                                <a href="https://printe.in/product/Mini-Frame-Table-Stand">
+                                  <img   fetchpriority="high" loading="eager" src="https://printe.s3.ap-south-1.amazonaws.com/1769750789316-fhimnvwojhp.jpeg"
+                                    alt="" width="100%" style="height: auto; max-width: 100%; display: block;" />
+                                </a>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+
+                        <!-- Product 2 -->
+                        <td align="center" valign="top" width="200" style="padding: 0 5px">
+                          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <tr>
+                              <td>
+                                <a href="https://printe.in/product/Victoria-Luxe">
+                                  <img   fetchpriority="high" loading="eager" src="https://printe.s3.ap-south-1.amazonaws.com/1769750525119-66j9p5twdc9.png"
+                                    alt="" width="100%" style="height: auto; max-width: 100%; display: block;" />
+                                </a>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+
+                        <!-- Product 3 -->
+                        <td align="center" valign="top" width="200" style="padding: 0 5px">
+                          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <tr>
+                              <td>
+                                <a href="https://printe.in/product/CorkyBizCombo">
+                                  <img   fetchpriority="high" loading="eager" src="https://printe.s3.ap-south-1.amazonaws.com/1769750733075-us5wijzyym.png"
+                                    alt="" width="100%" style="height: auto; max-width: 100%; display: block;" />
+                                </a>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr style="height: 30px;"></tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- SECTION 3: Footer with Logo, Social Media & Contact -->
+          <tr>
+            <td style="padding: 0;">
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                class="footer-section">
+                <tr>
+                  <td>
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" class="footer-table">
+                      <tr>
+                        <!-- Logo -->
+                        <td class="logo-cell">
+                          <a href="https://printe.in" style="text-decoration: none;">
+                            <img   fetchpriority="high" loading="eager" src="https://printe.s3.ap-south-1.amazonaws.com/1769854665731-6yn72ahfffb.png" alt="Printe Logo"
+                              class="logo-img" />
+                          </a>
+                        </td>
+
+                        <!-- Social Media -->
+                        <td class="social-cell">
+                          <div class="social-title">Follow us</div>
+                          <div class="social-icons">
+                            <a href="https://www.instagram.com/the.printe/" class="social-icon">
+                              <img   fetchpriority="high" loading="eager" src="https://cdn-icons-png.flaticon.com/512/174/174855.png" alt="Instagram" />
+                            </a>
+                            <a href="https://www.facebook.com/people/Printe/61578118705571/?sk=about" class="social-icon">
+                              <img   fetchpriority="high" loading="eager" src="https://cdn-icons-png.flaticon.com/512/124/124010.png" alt="Facebook" />
+                            </a>
+                            <a href="https://wa.me/919585610000" class="social-icon">
+                              <img   fetchpriority="high" loading="eager" src="https://cdn-icons-png.flaticon.com/512/124/124034.png" alt="WhatsApp" />
+                            </a>
+                            <a href="https://www.youtube.com/@PrintEOfficial" class="social-icon">
+                              <img   fetchpriority="high" loading="eager" src="https://cdn-icons-png.flaticon.com/512/174/174883.png" alt="YouTube" />
+                            </a>
+                          </div>
+                        </td>
+
+                        <!-- Contact Info -->
+                        <td class="contact-cell">
+                          <div class="contact-title">Contact info:-</div>
+                          <div class="contact-info">
+                            Email: <a href="mailto:info@printe.in">info@printe.in</a><br />
+                            Customer care: <a href="tel:+919585610000">+91 95856 10000</a>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+        </table>
+        <!-- End Email Content Table -->
+      </td>
+    </tr>
+  </table>
+  <!-- End Main Container -->
+</body>
+
+</html>
