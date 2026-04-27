@@ -4,7 +4,7 @@ const multer   = require("multer");
 const path     = require("path");
 
 const job      = require("../controller/Job.controller");
-const material = require("../controller/material_issue.controller"); // consistent lowercase
+const material = require("../controller/Material_issue.controller"); // consistent lowercase
 
 // ── Multer config ─────────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
