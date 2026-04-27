@@ -6,42 +6,33 @@ const { PlaintoHash, GenerateToken, EncryptPassword } = require("../helper/share
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
+    console.log("1. Body received:", { email, password }); // ← add
 
-    // Use findOne instead of aggregate for simplicity
     const user = await AdminUsersSchema.findOne({ email });
+    console.log("2. User found:", user ? "yes" : "no"); // ← add
 
-    if (!user) {
-      return errorResponse(res, INVALID_ACCOUNT_DETAILS);
-    }
+    if (!user) return errorResponse(res, INVALID_ACCOUNT_DETAILS);
 
     const isPasswordValid = await PlaintoHash(password, user.password);
+    console.log("3. Password valid:", isPasswordValid); // ← add
 
-    if (!isPasswordValid) {
-      return errorResponse(res, INCORRECT_PASSWORD);
-    }
+    if (!isPasswordValid) return errorResponse(res, INCORRECT_PASSWORD);
 
-    // Update online status (but don't save yet – or save if you want)
     user.isOnline = true;
-    await user.save(); // optional
+    await user.save();
 
-    const payload = {
-      id: user._id,
-      email: user.email,
-      role: user.role,
-    };
+    const payload = { id: user._id, email: user.email, role: user.role };
     const token = await GenerateToken(payload);
+    console.log("4. Token generated:", token ? "yes" : "no"); // ← add
 
-    // Convert user to object and remove sensitive fields
     const userObj = user.toObject();
     delete userObj.password;
 
-    return successResponse(res, LOGIN_SUCCESS, {
-      ...userObj,
-      token,
-    });
+    return successResponse(res, LOGIN_SUCCESS, { ...userObj, token });
   } catch (err) {
-    console.error("Login error:", err);
-    return errorResponse(res, "An error occurred while logging in");
+    console.error("Login FULL error:", err.message); // ← change this
+    console.error("Login STACK:", err.stack);        // ← add this
+    return res.status(500).json({ error: err.message }); // ← return real error
   }
 };
 

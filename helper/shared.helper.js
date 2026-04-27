@@ -1,4 +1,4 @@
-const bcrypt = require("bcrypt");
+const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const _ = require("lodash");
 const { errorResponse, successResponse } = require("../helper/response.helper");
