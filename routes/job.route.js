@@ -3,7 +3,7 @@ const router   = express.Router();
 const multer   = require("multer");
 const path     = require("path");
 
-const job      = require("../controller/job.controller");
+const job      = require("../controller/Job.controller");
 const material = require("../controller/material_issue.controller"); // consistent lowercase
 
 // ── Multer config ─────────────────────────────────────────────────────────────
