@@ -37,23 +37,24 @@ app.get("/", (req, res) => {
 
 
 app.use("/api", router);
-
+// Add this AFTER all routes, before app.listen
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    message: process.env.NODE_ENV === "development" ? err.message : undefined,
+  });
+});
 
 // ==================== START ====================
 
 const Port = process.env.PORT || 8080;
 const Host = process.env.HOST || "0.0.0.0";
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    app.listen(Port, Host, () => {
-      console.log(`\n🚀 VPS server running on http://${Host}:${Port}`);
-      console.log(`📦 MongoDB connected`);
-      console.log(`🌐 Environment: ${process.env.NODE_ENV || "development"}`);
-    });
-  })
-  .catch((err) => {
-    console.error("MongoDB connection error:", err);
-    process.exit(1);
+mongoose.connect(process.env.MONGODB_URI).then(() => {
+  app.listen(Port, Host, () => {
+    const localIp = require("os").networkInterfaces()["eth0"]?.[0]?.address ||
+                    require("os").networkInterfaces()["wlan0"]?.[0]?.address;
+    console.log(`🚀 Server on http://${localIp || Host}:${Port}`);
   });
+});
