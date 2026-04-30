@@ -4,10 +4,10 @@ const multer   = require("multer");
 const path     = require("path");
 
 const job      = require("../controller/Job.controller");
-const material = require("../controller/Material_issue.controller"); // consistent lowercase
+const material = require("../controller/Material_issue.controller");
 
-// ── Multer config ─────────────────────────────────────────────────────────────
-const storage = multer.diskStorage({
+// ── Multer config for design files ───────────────────────────────────────────
+const designStorage = multer.diskStorage({
   destination: (req, file, cb) => { cb(null, "uploads/designs/"); },
   filename:    (req, file, cb) => {
     const ext      = path.extname(file.originalname);
@@ -16,8 +16,8 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  storage: designStorage,
+  limits:  { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|pdf|ai|psd|eps|cdr/i;
     if (allowed.test(path.extname(file.originalname))) cb(null, true);
@@ -25,7 +25,7 @@ const upload = multer({
   },
 });
 
-// ── Multer config for QC images ───────────────────────────────────────────────
+// ── Multer config for QC images (only used for legacy multipart uploads) ──────
 const qcStorage = multer.diskStorage({
   destination: (req, file, cb) => { cb(null, "uploads/qc/"); },
   filename:    (req, file, cb) => {
@@ -36,13 +36,22 @@ const qcStorage = multer.diskStorage({
 });
 const qcUpload = multer({
   storage: qcStorage,
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits:  { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|webp/i;
     if (allowed.test(path.extname(file.originalname))) cb(null, true);
     else cb(new Error("Only image files are allowed for QC photos"));
   },
 });
+
+// ── Middleware: run multer only for multipart requests (skip for JSON) ────────
+const optionalQcUpload = (req, res, next) => {
+  const ct = req.headers["content-type"] || "";
+  if (ct.includes("multipart/form-data")) {
+    return qcUpload.array("qc_images", 20)(req, res, next);
+  }
+  next(); // JSON body — skip multer entirely, req.body already parsed by express.json()
+};
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 router.post("/",      job.createJob);
@@ -72,23 +81,27 @@ router.post("/:id/hold",           job.holdJob);
 router.post("/:id/reject",         job.rejectJob);
 
 // ── Design File ───────────────────────────────────────────────────────────────
-router.post("/:id/upload_design",  upload.single("design_file"), job.uploadDesign);
-router.post("/:id/approve_design", job.approveDesign);
-router.post("/:id/reject_design",  job.rejectDesign);
+router.post("/:id/upload_design",      upload.single("design_file"), job.uploadDesign);
+router.post("/:id/approve_design",     job.approveDesign);
+router.post("/:id/reject_design",      job.rejectDesign);
+router.post("/:id/approve_production", job.approveProduction);
+router.post("/:id/approve_qc",         job.approveqc);
 
-// ── Quality Check (NEW) ───────────────────────────────────────────────────────
-router.post("/:id/qc/update",          qcUpload.array("qc_images", 20), job.updateQC);
-router.post("/:id/qc/pass",            job.passQC);
-router.post("/:id/qc/fail",            job.failQC);
+// ── Quality Check ─────────────────────────────────────────────────────────────
+// optionalQcUpload: handles both JSON (S3 URLs) and multipart (file uploads)
+router.post("/:id/qc/update", optionalQcUpload, job.updateQC);
+router.post("/:id/qc/pass",   job.passQC);
+router.post("/:id/qc/fail",   job.failQC);
 
 // ── Material Issuance ─────────────────────────────────────────────────────────
-router.post("/:jobId/material/issue",  material.issueMaterial);
-router.get( "/:jobId/material",        material.getJobMaterials);
+router.post("/:jobId/material/issue", material.issueMaterial);
+router.get( "/:jobId/material",       material.getJobMaterials);
 
 // ── History & Reports ─────────────────────────────────────────────────────────
 router.get("/:id/workflow", job.getWorkflowHistory);
 
 // ── Conversion ────────────────────────────────────────────────────────────────
-router.post("/:id/convert", job.convertToOrder);
+router.post("/:id/convert",  job.convertToOrder);
+router.post("/:id/restore",  job.restoreJob);
 
 module.exports = router;

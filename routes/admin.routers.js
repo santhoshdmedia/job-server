@@ -4,7 +4,7 @@ const {VerfiyToken} = require("../helper/shared.helper")
 
 
 router.get("/get_admin",getAdmin);
-router.post("/add_admin",VerfiyToken,addAdmin);
+router.post("/add_admin",addAdmin);
 router.put("/update_admin/:id",VerfiyToken,updateAdmin);
 router.delete("/delete_admin/:id",VerfiyToken,deleteAdmin);
 
