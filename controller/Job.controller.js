@@ -262,7 +262,6 @@ exports.assignJob = async (req, res) => {
       assigned_to:  { user_id: assigned_to.user_id, name: assigned_to.name, role: assigned_to.role || "" },
       since:        now,
     };
-    job.job_status        = "in_progress";
     job.status_updated_at = now;
     await job.save();
 
@@ -645,7 +644,7 @@ exports.uploadDesign = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveDesign = async (req, res) => {
   try {
-    const { handled_by, design_file } = req.body;
+    const { handled_by, design_file,drive_link } = req.body;
 
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -654,6 +653,7 @@ exports.approveDesign = async (req, res) => {
     job.design_approved_at = new Date();
     job.design_approved_by = handled_by?.user_id || "Admin";
     if (design_file) job.design_file = design_file;
+    if (drive_link) job.design_drive_link = drive_link;
     await job.save();
 
     return resp(res, 200, true, "Design approved.", { design_status: job.design_status });
