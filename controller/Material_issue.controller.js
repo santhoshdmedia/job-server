@@ -23,62 +23,7 @@ const resp = (res, status, success, message, data = null) => {
   return res.status(status).json(payload);
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: decrement product stock (records a stock-out entry)
-// ─────────────────────────────────────────────────────────────────────────────
-const decrementStock = async (product_id, qty, handler_name, notes) => {
-  const product = await Product.findById(product_id);
-  if (!product) throw new Error(`Material product not found: ${product_id}`);
 
-  const current = product.stock_count || 0;
-  if (current < qty) {
-    throw new Error(
-      `Insufficient stock. Available: ${current}, Requested: ${qty}`
-    );
-  }
-
-  product.stock_count = parseFloat((current - qty).toFixed(4));
-  product.stock_offline = product.stock_offline || [];
-  product.stock_offline.push({
-    date:             new Date(),
-    stock:            qty,
-    customer_details: "Material issued for print job",
-    handler_name:     handler_name || "Store Manager",
-    notes:            notes || "",
-  });
-
-  // Derive status label
-  if (product.stock_count <= 0)       product.stocks_status = "Out of Stock";
-  else if (product.stock_count <= 10) product.stocks_status = "Limited";
-  else                                product.stocks_status = "In Stock";
-
-  await product.save();
-  return product;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: increment product stock on return
-// ─────────────────────────────────────────────────────────────────────────────
-const incrementStock = async (product_id, qty, handler_name, notes) => {
-  const product = await Product.findById(product_id);
-  if (!product) throw new Error(`Material product not found: ${product_id}`);
-
-  product.stock_count = parseFloat(((product.stock_count || 0) + qty).toFixed(4));
-  product.stock_info = product.stock_info || [];
-  product.stock_info.push({
-    date:         new Date(),
-    add_stock:    qty,
-    handler_name: handler_name || "Store Manager",
-    notes:        notes || "Material returned from print job",
-  });
-
-  if (product.stock_count <= 0)       product.stocks_status = "Out of Stock";
-  else if (product.stock_count <= 10) product.stocks_status = "Limited";
-  else                                product.stocks_status = "In Stock";
-
-  await product.save();
-  return product;
-};
 
 // =============================================================================
 // 1. CALCULATE REQUIRED MATERIAL  (preview — no DB write)
@@ -175,16 +120,256 @@ exports.issueMaterial = async (req, res) => {
   try {
     const { jobId } = req.params;
     const {
-      cart_item_index    = 0,
+      cart_item_index     = 0,
       material,
       issued_qty,
-      dimensions,
-      margin_top_in      = 4,
-      margin_bottom_in   = 3,
-      wastage_buffer_pct = 20,
+      calc_mode           = "server",   // "sqft" | "server"
+      sq_ft,                            // present when calc_mode === "sqft"
+      dimensions,                       // present when calc_mode === "server"
+      margin_top_in       = 4,
+      margin_bottom_in    = 3,
+      wastage_buffer_pct  = 20,
       issued_to,
       issued_by,
-      issue_notes        = "",
+      issue_notes         = "",
+    } = req.body;
+ 
+    // ── Validate required fields ─────────────────────────────────────────────
+    if (!material?.product_id)
+      return resp(res, 400, false, "material.product_id is required.");
+    if (!issued_qty || issued_qty <= 0)
+      return resp(res, 400, false, "issued_qty must be greater than 0.");
+    if (!issued_to?.user_id || !issued_to?.name)
+      return resp(res, 400, false, "issued_to.user_id and issued_to.name are required.");
+    if (!issued_by?.user_id || !issued_by?.name)
+      return resp(res, 400, false, "issued_by.user_id and issued_by.name are required.");
+ 
+    // Mode-specific dimension validation
+    if (calc_mode === "sqft") {
+      const parsedSqFt = parseFloat(sq_ft);
+      if (!parsedSqFt || parsedSqFt <= 0)
+        return resp(res, 400, false, "sq_ft must be greater than 0 when calc_mode is 'sqft'.");
+    } else {
+      if (!dimensions?.width || !dimensions?.height)
+        return resp(res, 400, false, "dimensions.width and dimensions.height are required when calc_mode is 'server'.");
+    }
+ 
+    // ── Validate job ─────────────────────────────────────────────────────────
+    const job = await Job.findById(jobId).lean();
+    if (!job) return resp(res, 404, false, "Job not found.");
+ 
+    // ── Validate product ─────────────────────────────────────────────────────
+    const product = await Product.findById(material.product_id).lean();
+    if (!product) return resp(res, 404, false, "Material product not found.");
+ 
+    // ── Validate employee ────────────────────────────────────────────────────
+    const employee = await AdminUsers.findById(issued_to.user_id).lean();
+    if (!employee) return resp(res, 404, false, "Employee (issued_to) not found.");
+ 
+    // ── Stock check ──────────────────────────────────────────────────────────
+    const available = product.stock_count || 0;
+    if (available < issued_qty)
+      return resp(res, 400, false,
+        `Insufficient stock for "${product.name}". Available: ${available} ${material.unit || "sqft"}, Requested: ${issued_qty}`
+      );
+ 
+    // ── Build calculation snapshot ───────────────────────────────────────────
+    // This is frozen at issue-time for audit purposes regardless of calc mode.
+    const buf = parseFloat(wastage_buffer_pct) || 0;
+ 
+    let calc;
+    let dimensionRecord; // stored in the issue document
+ 
+    if (calc_mode === "sqft") {
+      // Frontend calculated; we re-derive on the server to ensure consistency
+      const cartSqFt   = parseFloat(sq_ft);
+      const wastage    = parseFloat((cartSqFt * buf / 100).toFixed(4));
+      const required   = parseFloat((cartSqFt + wastage).toFixed(4));
+ 
+      calc = {
+        job_sqft:             cartSqFt,
+        margin_sqft:          0,
+        gross_sqft:           cartSqFt,
+        wastage_buffer_pct:   buf,
+        buffer_sqft:          wastage,
+        required_sqft:        required,
+        margin_top_inches:    0,
+        margin_bottom_inches: 0,
+      };
+ 
+      // Store cart dimensions as a best-effort from the cart item size string
+      // (Frontend may not send these in sqft mode; we fall back to zeros)
+      dimensionRecord = {
+        width:  dimensions?.width  || 0,
+        height: dimensions?.height || 0,
+        unit:   "ft",
+      };
+    } else {
+      // Server authoritative calculation from explicit W×H + margins
+      calc = MaterialIssue.calculateRequired({
+        width_ft:           dimensions.width,
+        height_ft:          dimensions.height,
+        margin_top_in,
+        margin_bottom_in,
+        wastage_buffer_pct: buf,
+      });
+ 
+      dimensionRecord = {
+        width:  dimensions.width,
+        height: dimensions.height,
+        unit:   dimensions.unit || "ft",
+      };
+    }
+ 
+    // ── Generate issue number ────────────────────────────────────────────────
+    const issue_no = await MaterialIssue.generateIssueNo();
+ 
+    // ── Snapshot cart item name ──────────────────────────────────────────────
+    const cartItem       = job.cart_items?.[cart_item_index];
+    const cart_item_name = cartItem?.product_name || "";
+ 
+    // ── Create issue record ──────────────────────────────────────────────────
+    const issue = await MaterialIssue.create({
+      issue_no,
+      job_id:          jobId,
+      job_no:          job.job_no,
+      cart_item_index,
+      cart_item_name,
+      calc_mode,                // "sqft" | "server" — preserved for audit
+      sq_ft:           calc_mode === "sqft" ? parseFloat(sq_ft) : null,
+      material: {
+        product_id:   material.product_id,
+        product_name: product.name,
+        unit:         material.unit || "sqft",
+      },
+      issued_qty,
+      suggested_qty:   calc.required_sqft,
+      issued_at:       new Date(),
+      issued_to: {
+        user_id: issued_to.user_id,
+        name:    issued_to.name,
+        role:    issued_to.role || "",
+      },
+      issued_by: {
+        user_id: issued_by.user_id,
+        name:    issued_by.name,
+        role:    issued_by.role || "",
+      },
+      dimensions: dimensionRecord,
+      calculation: {
+        job_sqft:             calc.job_sqft,
+        margin_sqft:          calc.margin_sqft,
+        gross_sqft:           calc.gross_sqft,
+        wastage_buffer_pct:   buf,
+        buffer_sqft:          parseFloat((calc.gross_sqft * buf / 100).toFixed(4)),
+        required_sqft:        calc.required_sqft,
+        margin_top_inches:    calc_mode === "server" ? (parseFloat(margin_top_in)  || 0) : 0,
+        margin_bottom_inches: calc_mode === "server" ? (parseFloat(margin_bottom_in) || 0) : 0,
+      },
+      issue_notes,
+      status: "issued",
+    });
+ 
+    // ── Decrement stock ──────────────────────────────────────────────────────
+    await decrementStock(
+      material.product_id,
+      issued_qty,
+      issued_by.name,
+      `Issued for job ${job.job_no} (Issue: ${issue_no})`
+    );
+ 
+    return resp(res, 201, true, `Material issued successfully. Issue No: ${issue_no}`, {
+      issue_no,
+      issue_id:        issue._id,
+      job_no:          job.job_no,
+      material_name:   product.name,
+      issued_qty,
+      suggested_qty:   calc.required_sqft,
+      issued_to:       issued_to.name,
+      calculation:     calc,
+      stock_remaining: parseFloat((available - issued_qty).toFixed(4)),
+    });
+ 
+  } catch (err) {
+    console.error("issueMaterial:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+
+/** Decrement product.stock_count; logs a note */
+const decrementStock = async (productId, qty, actorName, note) => {
+  await Product.findByIdAndUpdate(productId, {
+    $inc:  { stock_count: -qty },
+    $push: {
+      stock_log: {
+        action:     "decrement",
+        qty,
+        actor_name: actorName,
+        note,
+        logged_at:  new Date(),
+      },
+    },
+  });
+};
+
+/** Increment product.stock_count on return */
+const incrementStock = async (productId, qty, actorName, note) => {
+  await Product.findByIdAndUpdate(productId, {
+    $inc:  { stock_count: qty },
+    $push: {
+      stock_log: {
+        action:     "increment",
+        qty,
+        actor_name: actorName,
+        note,
+        logged_at:  new Date(),
+      },
+    },
+  });
+};
+
+/** Build a human-readable return summary for the API response */
+const buildReturnSummary = (issue) => {
+  const r    = issue.return;
+  const calc = issue.calculation;
+  if (!r) return null;
+  return {
+    efficiency_pct: parseFloat(
+      ((r.actual_used_qty / issue.issued_qty) * 100).toFixed(2)
+    ),
+    over_issued_sqft: parseFloat(
+      (issue.issued_qty - calc.required_sqft).toFixed(4)
+    ),
+    actual_vs_expected_wastage: parseFloat(
+      (r.actual_wastage_qty - r.expected_wastage_qty).toFixed(4)
+    ),
+    verdict:
+      r.performance_rating === "good"
+        ? "Great — material used efficiently."
+        : r.performance_rating === "acceptable"
+        ? "Within acceptable range."
+        : "High wastage — flagged for review.",
+  };
+};
+
+
+exports.issueMaterial = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const {
+      cart_item_index     = 0,
+      material,
+      issued_qty,
+      calc_mode           = "server",   // "sqft" | "server"
+      sq_ft,                            // present when calc_mode === "sqft"
+      dimensions,                       // present when calc_mode === "server"
+      margin_top_in       = 4,
+      margin_bottom_in    = 3,
+      wastage_buffer_pct  = 20,
+      issued_to,
+      issued_by,
+      issue_notes         = "",
     } = req.body;
 
     // ── Validate required fields ─────────────────────────────────────────────
@@ -192,47 +377,86 @@ exports.issueMaterial = async (req, res) => {
       return resp(res, 400, false, "material.product_id is required.");
     if (!issued_qty || issued_qty <= 0)
       return resp(res, 400, false, "issued_qty must be greater than 0.");
-    if (!dimensions?.width || !dimensions?.height)
-      return resp(res, 400, false, "dimensions.width and dimensions.height are required.");
     if (!issued_to?.user_id || !issued_to?.name)
       return resp(res, 400, false, "issued_to.user_id and issued_to.name are required.");
     if (!issued_by?.user_id || !issued_by?.name)
       return resp(res, 400, false, "issued_by.user_id and issued_by.name are required.");
 
-    // ── Validate job exists ──────────────────────────────────────────────────
+    // Mode-specific dimension validation
+    if (calc_mode === "sqft") {
+      const parsedSqFt = parseFloat(sq_ft);
+      if (!parsedSqFt || parsedSqFt <= 0)
+        return resp(res, 400, false, "sq_ft must be greater than 0 when calc_mode is 'sqft'.");
+    } else {
+      if (!dimensions?.width || !dimensions?.height)
+        return resp(res, 400, false, "dimensions.width and dimensions.height are required when calc_mode is 'server'.");
+    }
+
+    // ── Validate job ─────────────────────────────────────────────────────────
     const job = await Job.findById(jobId).lean();
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    // ── Validate product (material) exists ───────────────────────────────────
+    // ── Validate product ─────────────────────────────────────────────────────
     const product = await Product.findById(material.product_id).lean();
     if (!product) return resp(res, 404, false, "Material product not found.");
 
-    // ── Validate employee exists ─────────────────────────────────────────────
+    // ── Validate employee ────────────────────────────────────────────────────
     const employee = await AdminUsers.findById(issued_to.user_id).lean();
     if (!employee) return resp(res, 404, false, "Employee (issued_to) not found.");
 
-    // ── Check stock availability ─────────────────────────────────────────────
+    // ── Stock check ──────────────────────────────────────────────────────────
     const available = product.stock_count || 0;
-    if (available < issued_qty) {
+    if (available < issued_qty)
       return resp(res, 400, false,
         `Insufficient stock for "${product.name}". Available: ${available} ${material.unit || "sqft"}, Requested: ${issued_qty}`
       );
+
+    // ── Build calculation snapshot ───────────────────────────────────────────
+    const buf = parseFloat(wastage_buffer_pct) || 0;
+
+    let calc;
+    let dimensionRecord;
+
+    if (calc_mode === "sqft") {
+      const cartSqFt = parseFloat(sq_ft);
+      const wastage  = parseFloat((cartSqFt * buf / 100).toFixed(4));
+      const required = parseFloat((cartSqFt + wastage).toFixed(4));
+
+      calc = {
+        job_sqft:             cartSqFt,
+        margin_sqft:          0,
+        gross_sqft:           cartSqFt,
+        wastage_buffer_pct:   buf,
+        buffer_sqft:          wastage,
+        required_sqft:        required,
+        margin_top_inches:    0,
+        margin_bottom_inches: 0,
+      };
+      // Dimensions may not be sent in sqft mode; store zeros as fallback
+      dimensionRecord = {
+        width:  dimensions?.width  || 0,
+        height: dimensions?.height || 0,
+        unit:   "ft",
+      };
+    } else {
+      calc = MaterialIssue.calculateRequired({
+        width_ft:           dimensions.width,
+        height_ft:          dimensions.height,
+        margin_top_in,
+        margin_bottom_in,
+        wastage_buffer_pct: buf,
+      });
+      dimensionRecord = {
+        width:  dimensions.width,
+        height: dimensions.height,
+        unit:   dimensions.unit || "ft",
+      };
     }
 
-    // ── Compute system calculation (frozen at issue time) ────────────────────
-    const calc = MaterialIssue.calculateRequired({
-      width_ft:           dimensions.width,
-      height_ft:          dimensions.height,
-      margin_top_in,
-      margin_bottom_in,
-      wastage_buffer_pct,
-    });
-
-    // ── Generate issue number ─────────────────────────────────────────────────
+    // ── Generate issue number ────────────────────────────────────────────────
     const issue_no = await MaterialIssue.generateIssueNo();
 
-    // ── Get cart item name snapshot ──────────────────────────────────────────
-    const cartItem     = job.cart_items?.[cart_item_index];
+    const cartItem       = job.cart_items?.[cart_item_index];
     const cart_item_name = cartItem?.product_name || "";
 
     // ── Create issue record ──────────────────────────────────────────────────
@@ -240,6 +464,8 @@ exports.issueMaterial = async (req, res) => {
       issue_no,
       job_id:          jobId,
       job_no:          job.job_no,
+      calc_mode,
+      sq_ft:           calc_mode === "sqft" ? parseFloat(sq_ft) : null,
       cart_item_index,
       cart_item_name,
       material: {
@@ -260,26 +486,22 @@ exports.issueMaterial = async (req, res) => {
         name:    issued_by.name,
         role:    issued_by.role || "",
       },
-      dimensions: {
-        width:  dimensions.width,
-        height: dimensions.height,
-        unit:   dimensions.unit || "ft",
-      },
+      dimensions: dimensionRecord,
       calculation: {
         job_sqft:             calc.job_sqft,
         margin_sqft:          calc.margin_sqft,
         gross_sqft:           calc.gross_sqft,
-        wastage_buffer_pct,
-        buffer_sqft:          parseFloat((calc.gross_sqft * wastage_buffer_pct / 100).toFixed(4)),
+        wastage_buffer_pct:   buf,
+        buffer_sqft:          parseFloat((calc.gross_sqft * buf / 100).toFixed(4)),
         required_sqft:        calc.required_sqft,
-        margin_top_inches:    margin_top_in,
-        margin_bottom_inches: margin_bottom_in,
+        margin_top_inches:    calc_mode === "server" ? (parseFloat(margin_top_in)    || 0) : 0,
+        margin_bottom_inches: calc_mode === "server" ? (parseFloat(margin_bottom_in) || 0) : 0,
       },
       issue_notes,
       status: "issued",
     });
 
-    // ── Decrement product stock ──────────────────────────────────────────────
+    // ── Decrement stock ──────────────────────────────────────────────────────
     await decrementStock(
       material.product_id,
       issued_qty,
@@ -289,13 +511,13 @@ exports.issueMaterial = async (req, res) => {
 
     return resp(res, 201, true, `Material issued successfully. Issue No: ${issue_no}`, {
       issue_no,
-      issue_id:      issue._id,
-      job_no:        job.job_no,
-      material_name: product.name,
+      issue_id:        issue._id,
+      job_no:          job.job_no,
+      material_name:   product.name,
       issued_qty,
-      suggested_qty: calc.required_sqft,
-      issued_to:     issued_to.name,
-      calculation:   calc,
+      suggested_qty:   calc.required_sqft,
+      issued_to:       issued_to.name,
+      calculation:     calc,
       stock_remaining: parseFloat((available - issued_qty).toFixed(4)),
     });
   } catch (err) {
@@ -304,22 +526,386 @@ exports.issueMaterial = async (req, res) => {
   }
 };
 
-// =============================================================================
-// 3. RECORD MATERIAL RETURN  (employee returns leftover roll after printing)
-// POST /api/material/:issueId/return
-//
-// Body:
-// {
-//   "returned_qty"        : 5.2,          // sqft physically returned to store
-//   "wastage_reason"      : "margin_trim", // see enum in model
-//   "wastage_reason_notes": "Standard top & bottom trim",  // optional
-//   "returned_by": {
-//     "user_id": "EMPLOYEE_USER_ID",
-//     "name"   : "Ravi",
-//     "role"   : "printing team"
-//   }
-// }
-// =============================================================================
+
+exports.recordProductionCompletion = async (req, res) => {
+  try {
+    const { issueId } = req.params;
+    const {
+      machine_name               = "",
+      ink_used                   = [],   // [{ color, quantity, unit }]
+      ink_notes                  = "",
+      production_started_at      = null, // ISO string sent from frontend timer
+      production_completed_at    = null,
+      production_duration_seconds = 0,
+    } = req.body;
+
+    if (!machine_name?.trim())
+      return resp(res, 400, false, "machine_name is required.");
+
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue) return resp(res, 404, false, "Material issue record not found.");
+
+    // Validate ink_used array items
+    if (!Array.isArray(ink_used))
+      return resp(res, 400, false, "ink_used must be an array.");
+    for (const ink of ink_used) {
+      if (!ink.color?.trim())
+        return resp(res, 400, false, "Each ink entry must have a color field.");
+      if (ink.quantity < 0)
+        return resp(res, 400, false, "Ink quantity cannot be negative.");
+    }
+
+    issue.applyProductionCompletion({
+      machine_name,
+      ink_used,
+      ink_notes,
+      production_started_at,
+      production_completed_at,
+      production_duration_seconds,
+    });
+
+    await issue.save();
+
+    return resp(res, 200, true, "Production metadata saved.", {
+      issue_no:                    issue.issue_no,
+      machine_name:                issue.machine_name,
+      ink_used:                    issue.ink_used,
+      ink_notes:                   issue.ink_notes,
+      production_duration_display: issue.production_duration_display,
+      production_started_at:       issue.production_started_at,
+      production_completed_at:     issue.production_completed_at,
+    });
+  } catch (err) {
+    console.error("recordProductionCompletion:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. RECORD RETURN
+// POST /material/:issueId/return
+// ─────────────────────────────────────────────────────────────────────────────
+exports.recordReturn = async (req, res) => {
+  try {
+    const { issueId } = req.params;
+    const {
+      returned_qty,
+      wastage_reason               = "margin_trim",
+      wastage_reason_notes         = "",
+      returned_by                  = {},
+      // ── Production metadata (optional, saved here if /production was skipped)
+      machine_name                 = "",
+      ink_used                     = [],
+      ink_notes                    = "",
+      production_started_at        = null,
+      production_completed_at      = null,
+      production_duration_seconds  = 0,
+    } = req.body;
+
+    // ── Validation ────────────────────────────────────────────────────────────
+    if (returned_qty === undefined || returned_qty === null)
+      return resp(res, 400, false, "returned_qty is required (use 0 if nothing returned).");
+    if (returned_qty < 0)
+      return resp(res, 400, false, "returned_qty cannot be negative.");
+
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue)
+      return resp(res, 404, false, "Material issue record not found.");
+
+    if (issue.status === "returned" || issue.status === "no_return")
+      return resp(res, 409, false,
+        `Return already recorded for issue ${issue.issue_no}. Use the review endpoint to add manager notes.`
+      );
+
+    if (returned_qty > issue.issued_qty)
+      return resp(res, 400, false,
+        `Returned qty (${returned_qty}) cannot exceed issued qty (${issue.issued_qty}).`
+      );
+
+    // ── Save production metadata only if not already set ──────────────────────
+    const alreadyHasProductionData =
+      issue.machine_name ||
+      (issue.ink_used && issue.ink_used.length > 0) ||
+      issue.production_duration_seconds > 0;
+
+    if (!alreadyHasProductionData) {
+      issue.applyProductionCompletion({
+        machine_name,
+        ink_used,
+        ink_notes,
+        production_started_at,
+        production_completed_at,
+        production_duration_seconds,
+      });
+    }
+
+    // ── Apply return + wastage calculation ────────────────────────────────────
+    issue.applyReturn({
+      returned_qty,
+      wastage_reason,
+      wastage_reason_notes,
+      returned_by,
+    });
+
+    await issue.save();
+
+    // ── Stock increment ───────────────────────────────────────────────────────
+    if (returned_qty > 0) {
+      await incrementStock(
+        issue.material.product_id,
+        returned_qty,
+        returned_by.name || "",
+        `Return from job ${issue.job_no} (Issue: ${issue.issue_no})`
+      );
+    }
+
+    const ret = issue.return;
+
+    return resp(res, 200, true, "Material return recorded successfully.", {
+      issue_no:                    issue.issue_no,
+      job_no:                      issue.job_no,
+      status:                      issue.status,
+      issued_qty:                  issue.issued_qty,
+      returned_qty:                ret.returned_qty,
+      actual_used_qty:             ret.actual_used_qty,
+      expected_used_qty:           ret.expected_used_qty,
+      actual_wastage_qty:          ret.actual_wastage_qty,
+      expected_wastage_qty:        ret.expected_wastage_qty,
+      wastage_ratio_pct:           ret.wastage_ratio_pct,
+      performance_rating:          ret.performance_rating,
+      is_flagged:                  ret.is_flagged,
+      wastage_reason:              ret.wastage_reason,
+      saved_qty:                   ret.saved_qty,
+      // ── Production fields echoed back ─────────────────────────────────────
+      machine_name:                issue.machine_name                || null,
+      ink_used:                    issue.ink_used                    || [],
+      ink_notes:                   issue.ink_notes                   || null,
+      production_duration_seconds: issue.production_duration_seconds || 0,
+      production_duration_display: issue.production_duration_display || "00:00:00",
+      summary:                     buildReturnSummary(issue),
+    });
+  } catch (err) {
+    console.error("recordReturn:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. REVIEW RETURN (manager)
+// POST/PUT /material/:issueId/review
+// ─────────────────────────────────────────────────────────────────────────────
+exports.reviewReturn = async (req, res) => {
+  try {
+    const { issueId } = req.params;
+    const { manager_by, manager_notes = "", override_rating = null } = req.body;
+
+    if (!manager_by?.user_id || !manager_by?.name)
+      return resp(res, 400, false, "manager_by.user_id and manager_by.name are required.");
+
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue) return resp(res, 404, false, "Material issue record not found.");
+    if (!issue.return) return resp(res, 400, false, "No return recorded yet for this issue.");
+
+    issue.applyManagerReview({ manager_by, manager_notes, override_rating });
+    await issue.save();
+
+    return resp(res, 200, true, "Manager review saved.", {
+      issue_no:          issue.issue_no,
+      manager_reviewed:  issue.return.manager_reviewed,
+      performance_rating: issue.return.performance_rating,
+      is_flagged:         issue.return.is_flagged,
+      manager_notes:      issue.return.manager_notes,
+    });
+  } catch (err) {
+    console.error("reviewReturn:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. LIST ISSUES
+// GET /material?limit=50&status=issued&job_id=xxx
+// ─────────────────────────────────────────────────────────────────────────────
+exports.listIssues = async (req, res) => {
+  try {
+    const {
+      limit    = 50,
+      page     = 1,
+      status,
+      job_id,
+      flagged,
+    } = req.query;
+
+    const filter = { is_deleted: { $ne: true } };
+    if (status)  filter.status = status;
+    if (job_id)  filter.job_id = job_id;
+    if (flagged === "true") filter["return.is_flagged"] = true;
+
+    const skip  = (parseInt(page) - 1) * parseInt(limit);
+    const total = await MaterialIssue.countDocuments(filter);
+    const issues = await MaterialIssue.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    return resp(res, 200, true, "Issues fetched.", {
+      issues,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), total_pages: Math.ceil(total / parseInt(limit)) },
+    });
+  } catch (err) {
+    console.error("listIssues:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. GET SINGLE ISSUE
+// GET /material/:issueId
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getIssue = async (req, res) => {
+  try {
+    const issue = await MaterialIssue.findById(req.params.issueId).lean();
+    if (!issue) return resp(res, 404, false, "Issue not found.");
+    return resp(res, 200, true, "Issue fetched.", issue);
+  } catch (err) {
+    console.error("getIssue:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. GET ISSUES BY JOB
+// GET /material/job/:jobId
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getIssuesByJob = async (req, res) => {
+  try {
+    const issues = await MaterialIssue.find({ job_id: req.params.jobId, is_deleted: { $ne: true } })
+      .sort({ issued_at: -1 })
+      .lean();
+    return resp(res, 200, true, "Issues for job fetched.", issues);
+  } catch (err) {
+    console.error("getIssuesByJob:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. CALCULATE MATERIAL (utility endpoint called by frontend W×H mode)
+// POST /material/calculate
+// ─────────────────────────────────────────────────────────────────────────────
+exports.calculateMaterial = async (req, res) => {
+  try {
+    const {
+      width_ft,
+      height_ft,
+      margin_top_in      = 4,
+      margin_bottom_in   = 3,
+      wastage_buffer_pct = 20,
+    } = req.body;
+
+    if (!width_ft || !height_ft || width_ft <= 0 || height_ft <= 0)
+      return resp(res, 400, false, "width_ft and height_ft must be positive numbers.");
+
+    const calc = MaterialIssue.calculateRequired({
+      width_ft, height_ft, margin_top_in, margin_bottom_in, wastage_buffer_pct,
+    });
+
+    return resp(res, 200, true, "Calculation complete.", calc);
+  } catch (err) {
+    console.error("calculateMaterial:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. WASTAGE REPORT
+// GET /material/report/wastage?from=YYYY-MM-DD&to=YYYY-MM-DD
+// ─────────────────────────────────────────────────────────────────────────────
+exports.wastageReport = async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFilter = {};
+    if (from) dateFilter.$gte = new Date(from);
+    if (to)   dateFilter.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
+
+    const matchStage = { is_deleted: { $ne: true }, "return": { $ne: null } };
+    if (from || to) matchStage.createdAt = dateFilter;
+
+    const [overall] = await MaterialIssue.aggregate([
+      { $match: matchStage },
+      {
+        $group: {
+          _id:                  null,
+          total_issued_qty:     { $sum: "$issued_qty" },
+          avg_wastage_ratio:    { $avg: "$return.wastage_ratio_pct" },
+          total_actual_wastage: { $sum: "$return.actual_wastage_qty" },
+          flagged_count:        { $sum: { $cond: ["$return.is_flagged", 1, 0] } },
+          good_count:           { $sum: { $cond: [{ $eq: ["$return.performance_rating", "good"] }, 1, 0] } },
+          acceptable_count:     { $sum: { $cond: [{ $eq: ["$return.performance_rating", "acceptable"] }, 1, 0] } },
+          high_wastage_count:   { $sum: { $cond: [{ $eq: ["$return.performance_rating", "high_wastage"] }, 1, 0] } },
+        },
+      },
+    ]);
+
+    const by_employee = await MaterialIssue.aggregate([
+      { $match: matchStage },
+      {
+        $group: {
+          _id:               "$issued_to.user_id",
+          employee_name:     { $first: "$issued_to.name" },
+          total_issues:      { $sum: 1 },
+          avg_wastage_ratio: { $avg: "$return.wastage_ratio_pct" },
+          good_count:        { $sum: { $cond: [{ $eq: ["$return.performance_rating", "good"] }, 1, 0] } },
+        },
+      },
+      {
+        $addFields: {
+          overall_rating: {
+            $switch: {
+              branches: [
+                { case: { $lte: ["$avg_wastage_ratio", 10] }, then: "good" },
+                { case: { $lte: ["$avg_wastage_ratio", 20] }, then: "acceptable" },
+              ],
+              default: "high_wastage",
+            },
+          },
+        },
+      },
+      { $sort: { avg_wastage_ratio: 1 } },
+    ]);
+
+    const by_wastage_reason = await MaterialIssue.aggregate([
+      { $match: matchStage },
+      { $group: { _id: "$return.wastage_reason", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]);
+
+    const by_machine = await MaterialIssue.aggregate([
+      { $match: { ...matchStage, machine_name: { $ne: "" } } },
+      {
+        $group: {
+          _id:               "$machine_name",
+          total_jobs:        { $sum: 1 },
+          total_sqft_issued: { $sum: "$issued_qty" },
+          avg_wastage_ratio: { $avg: "$return.wastage_ratio_pct" },
+          total_duration_s:  { $sum: "$production_duration_seconds" },
+        },
+      },
+      { $sort: { total_jobs: -1 } },
+    ]);
+
+    return resp(res, 200, true, "Wastage report generated.", {
+      overall:           overall || {},
+      by_employee,
+      by_wastage_reason,
+      by_machine,
+    });
+  } catch (err) {
+    console.error("wastageReport:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
 exports.recordReturn = async (req, res) => {
   try {
     const { issueId } = req.params;
@@ -878,23 +1464,7 @@ exports.deleteMaterialIssue = async (req, res) => {
 // INTERNAL HELPERS
 // =============================================================================
 
-/** Build a human-readable return summary from a Mongoose document */
-const buildReturnSummary = (issue) => {
-  if (!issue.return) return null;
-  const r = issue.return;
-  return {
-    issued:           `${issue.issued_qty} ${issue.material.unit}`,
-    returned:         `${r.returned_qty} ${issue.material.unit}`,
-    actually_used:    `${r.actual_used_qty} ${issue.material.unit}`,
-    expected_use:     `${r.expected_used_qty} ${issue.material.unit}`,
-    actual_wastage:   `${r.actual_wastage_qty} ${issue.material.unit}`,
-    expected_wastage: `${r.expected_wastage_qty} ${issue.material.unit}`,
-    wastage_ratio:    `${r.wastage_ratio_pct}%`,
-    performance:      r.performance_rating,
-    flagged:          r.is_flagged,
-    reason:           r.wastage_reason,
-  };
-};
+
 
 /** Same helper but works on plain lean() object */
 const buildReturnSummaryFromLean = (issue) => buildReturnSummary(issue);

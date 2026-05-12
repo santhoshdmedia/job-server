@@ -1,6 +1,7 @@
 // ==================== MATERIAL ISSUE MODEL ====================
 // Tracks flex roll / material issuance from store manager to employee,
-// and the subsequent return + wastage performance review.
+// the subsequent return + wastage performance review,
+// and production metadata (machine, ink, duration).
 
 const mongoose = require("mongoose");
 const { Schema } = mongoose;
@@ -11,22 +12,15 @@ const { Schema } = mongoose;
 
 /**
  * Calculate required material quantity based on job dimensions + margins.
- *
- * @param {number} width_ft        - Job width in feet
- * @param {number} height_ft       - Job height in feet
- * @param {number} margin_top_in   - Top margin in inches (default 4)
- * @param {number} margin_bottom_in - Bottom margin in inches (default 3)
- * @param {number} wastage_buffer_pct - Extra wastage % to add (default 20)
- * @returns {{ required_sqft, job_sqft, margin_sqft, with_buffer_sqft }}
  */
 const calculateRequired = ({
   width_ft,
   height_ft,
-  margin_top_in    = 4,
-  margin_bottom_in = 3,
+  margin_top_in      = 4,
+  margin_bottom_in   = 3,
   wastage_buffer_pct = 20,
 }) => {
-  const margin_ft     = (margin_top_in + margin_bottom_in) / 12;   // inches → feet
+  const margin_ft     = (margin_top_in + margin_bottom_in) / 12;
   const total_height  = height_ft + margin_ft;
   const job_sqft      = width_ft * height_ft;
   const margin_sqft   = width_ft * margin_ft;
@@ -45,10 +39,8 @@ const calculateRequired = ({
 
 /**
  * Determine employee performance based on wastage ratio.
- *
- * Thresholds:
  *   ≤ 10%  → good
- *   ≤ 20%  → acceptable   (known average)
+ *   ≤ 20%  → acceptable
  *   > 20%  → high_wastage (flagged)
  */
 const ratePerformance = (wastage_ratio_pct) => {
@@ -62,27 +54,38 @@ const ratePerformance = (wastage_ratio_pct) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const dimensionsSchema = new Schema(
   {
-    width:  { type: Number, required: true, min: 0 },   // in feet
-    height: { type: Number, required: true, min: 0 },   // in feet
-    unit:   { type: String, default: "ft" },             // ft | m | sqft
+    width:  { type: Number, required: true, min: 0 },
+    height: { type: Number, required: true, min: 0 },
+    unit:   { type: String, default: "ft" },
   },
   { _id: false }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sub-Schema: Calculation Breakdown
-// Stored at issue-time so the report is immutable even if formula changes.
+// Sub-Schema: Calculation Breakdown (frozen at issue time)
 // ─────────────────────────────────────────────────────────────────────────────
 const calculationSchema = new Schema(
   {
-    job_sqft:            { type: Number, default: 0 },  // pure print area
-    margin_sqft:         { type: Number, default: 0 },  // top+bottom margin area
-    gross_sqft:          { type: Number, default: 0 },  // job + margin, no buffer
-    wastage_buffer_pct:  { type: Number, default: 20 }, // % buffer added
-    buffer_sqft:         { type: Number, default: 0 },  // gross × buffer %
-    required_sqft:       { type: Number, default: 0 },  // gross + buffer (suggested issue qty)
-    margin_top_inches:   { type: Number, default: 4 },
-    margin_bottom_inches:{ type: Number, default: 3 },
+    job_sqft:             { type: Number, default: 0 },
+    margin_sqft:          { type: Number, default: 0 },
+    gross_sqft:           { type: Number, default: 0 },
+    wastage_buffer_pct:   { type: Number, default: 20 },
+    buffer_sqft:          { type: Number, default: 0 },
+    required_sqft:        { type: Number, default: 0 },
+    margin_top_inches:    { type: Number, default: 4 },
+    margin_bottom_inches: { type: Number, default: 3 },
+  },
+  { _id: false }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-Schema: Ink Usage Entry
+// ─────────────────────────────────────────────────────────────────────────────
+const inkUsageSchema = new Schema(
+  {
+    color:    { type: String, default: "" },  // e.g. "Cyan", "Magenta", "Black"
+    quantity: { type: Number, default: 0 },   // in ml
+    unit:     { type: String, default: "ml" },
   },
   { _id: false }
 );
@@ -92,8 +95,8 @@ const calculationSchema = new Schema(
 // ─────────────────────────────────────────────────────────────────────────────
 const returnSchema = new Schema(
   {
-    returned_qty:   { type: Number, required: true, min: 0 }, // sqft returned to store
-    returned_at:    { type: Date,   default: Date.now },
+    returned_qty:   { type: Number, required: true, min: 0 },
+    returned_at:    { type: Date, default: Date.now },
     returned_by: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
@@ -101,12 +104,12 @@ const returnSchema = new Schema(
     },
 
     // ── Wastage breakdown ────────────────────────────────────────────────────
-    actual_used_qty:      { type: Number, default: 0 },  // issued - returned
-    expected_used_qty:    { type: Number, default: 0 },  // calculation.gross_sqft
-    actual_wastage_qty:   { type: Number, default: 0 },  // actual_used - job_sqft
-    expected_wastage_qty: { type: Number, default: 0 },  // calculation.gross_sqft - job_sqft
-    wastage_ratio_pct:    { type: Number, default: 0 },  // (actual_wastage / issued) × 100
-    saved_qty:            { type: Number, default: 0 },  // returned > 0 → material saved
+    actual_used_qty:      { type: Number, default: 0 },
+    expected_used_qty:    { type: Number, default: 0 },
+    actual_wastage_qty:   { type: Number, default: 0 },
+    expected_wastage_qty: { type: Number, default: 0 },
+    wastage_ratio_pct:    { type: Number, default: 0 },
+    saved_qty:            { type: Number, default: 0 },
 
     // ── Performance ──────────────────────────────────────────────────────────
     performance_rating: {
@@ -119,12 +122,12 @@ const returnSchema = new Schema(
     wastage_reason: {
       type: String,
       enum: [
-        "margin_trim",       // normal top/bottom trim
-        "misprint",          // print error, had to redo
-        "roll_end",          // end of roll leftover
-        "color_calibration", // test print for color matching
-        "customer_change",   // customer changed spec mid-job
-        "equipment_fault",   // printer jam / head issue
+        "margin_trim",
+        "misprint",
+        "roll_end",
+        "color_calibration",
+        "customer_change",
+        "equipment_fault",
         "other",
       ],
       default: "margin_trim",
@@ -132,14 +135,14 @@ const returnSchema = new Schema(
     wastage_reason_notes: { type: String, default: "" },
 
     // ── Manager review ───────────────────────────────────────────────────────
-    manager_reviewed:   { type: Boolean, default: false },
+    manager_reviewed:  { type: Boolean, default: false },
     manager_review_by: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
     },
-    manager_review_at:    { type: Date,   default: null },
-    manager_notes:        { type: String, default: "" },
-    is_flagged:           { type: Boolean, default: false }, // auto-true when high_wastage
+    manager_review_at: { type: Date, default: null },
+    manager_notes:     { type: String, default: "" },
+    is_flagged:        { type: Boolean, default: false },
   },
   { _id: false }
 );
@@ -150,27 +153,31 @@ const returnSchema = new Schema(
 const materialIssueSchema = new Schema(
   {
     // ── Issue reference ──────────────────────────────────────────────────────
-    issue_no: { type: String, unique: true, index: true }, // e.g. MI0001
+    issue_no: { type: String, unique: true, index: true },
+
+    // ── Calc mode (sqft | server) — set at issue time, drives breakdown display
+    calc_mode: { type: String, enum: ["sqft", "server"], default: "server" },
+    sq_ft:     { type: Number, default: null }, // cart sq_ft, present when calc_mode === "sqft"
 
     // ── Linked job ───────────────────────────────────────────────────────────
     job_id:  { type: Schema.Types.ObjectId, ref: "job", required: true, index: true },
     job_no:  { type: String, default: "" },
 
-    // ── Cart item reference (which specific item in the job this is for) ─────
-    cart_item_index: { type: Number, default: 0 },         // index in job.cart_items
-    cart_item_name:  { type: String, default: "" },        // snapshot of product_name
+    // ── Cart item reference ───────────────────────────────────────────────────
+    cart_item_index: { type: Number, default: 0 },
+    cart_item_name:  { type: String, default: "" },
 
-    // ── Material (product = flex roll from your product collection) ───────────
+    // ── Material ──────────────────────────────────────────────────────────────
     material: {
       product_id:   { type: Schema.Types.ObjectId, ref: "product", required: true },
-      product_name: { type: String, default: "" },          // snapshot
-      unit:         { type: String, default: "sqft" },      // sqft | meters | rft
+      product_name: { type: String, default: "" },
+      unit:         { type: String, default: "sqft" },
     },
 
-    // ── Issuance ─────────────────────────────────────────────────────────────
-    issued_qty:     { type: Number, required: true, min: 0.01 }, // actual qty cut from roll
-    suggested_qty:  { type: Number, default: 0 },                // system-calculated suggestion
-    issued_at:      { type: Date,   default: Date.now },
+    // ── Issuance ──────────────────────────────────────────────────────────────
+    issued_qty:    { type: Number, required: true, min: 0.01 },
+    suggested_qty: { type: Number, default: 0 },
+    issued_at:     { type: Date, default: Date.now },
 
     issued_to: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", required: true },
@@ -183,19 +190,31 @@ const materialIssueSchema = new Schema(
       role:    { type: String, default: "" },
     },
 
-    // ── Job dimensions (used for calculation) ────────────────────────────────
+    // ── Job dimensions ────────────────────────────────────────────────────────
     dimensions: { type: dimensionsSchema, required: true },
 
-    // ── System calculation breakdown (frozen at issue time) ──────────────────
+    // ── System calculation breakdown (frozen at issue time) ───────────────────
     calculation: { type: calculationSchema, default: () => ({}) },
 
-    // ── Notes at issuance ────────────────────────────────────────────────────
+    // ── Issue notes ───────────────────────────────────────────────────────────
     issue_notes: { type: String, default: "" },
 
-    // ── Return (filled after job is done) ────────────────────────────────────
+    // ── Production metadata (filled when production is completed) ─────────────
+    machine_name: { type: String, default: "" },          // e.g. "HP Latex 360"
+    ink_used: { type: [inkUsageSchema], default: [] },    // per-colour ink breakdown
+    ink_notes: { type: String, default: "" },             // free-text ink note
+
+    // ── Production duration ───────────────────────────────────────────────────
+    // Set when production team submits the job via ProductionUploadPanel
+    production_started_at:    { type: Date, default: null },
+    production_completed_at:  { type: Date, default: null },
+    production_duration_seconds: { type: Number, default: 0 },
+    production_duration_display: { type: String, default: "00:00:00" },
+
+    // ── Return (filled after job is done) ─────────────────────────────────────
     return: { type: returnSchema, default: null },
 
-    // ── Status lifecycle ─────────────────────────────────────────────────────
+    // ── Status lifecycle ──────────────────────────────────────────────────────
     status: {
       type:    String,
       enum:    ["issued", "returned", "partial_return", "no_return"],
@@ -203,7 +222,7 @@ const materialIssueSchema = new Schema(
       index:   true,
     },
 
-    // ── Soft delete ──────────────────────────────────────────────────────────
+    // ── Soft delete ───────────────────────────────────────────────────────────
     is_deleted: { type: Boolean, default: false },
   },
   {
@@ -213,7 +232,7 @@ const materialIssueSchema = new Schema(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Indexes for common queries
+// Indexes
 // ─────────────────────────────────────────────────────────────────────────────
 materialIssueSchema.index({ "issued_to.user_id": 1, createdAt: -1 });
 materialIssueSchema.index({ "material.product_id": 1 });
@@ -239,14 +258,48 @@ materialIssueSchema.statics.generateIssueNo = async function () {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Static: Calculate required material (expose formula to controller)
+// Static: Expose formula to controller
 // ─────────────────────────────────────────────────────────────────────────────
 materialIssueSchema.statics.calculateRequired = calculateRequired;
+materialIssueSchema.statics.ratePerformance   = ratePerformance;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Static: Rate performance (expose to controller)
+// Static: Utility — format seconds → "HH:MM:SS"
 // ─────────────────────────────────────────────────────────────────────────────
-materialIssueSchema.statics.ratePerformance = ratePerformance;
+materialIssueSchema.statics.secsToDisplay = (totalSeconds) => {
+  const s   = Math.max(0, Math.floor(totalSeconds));
+  const h   = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m   = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const sec = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${sec}`;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance: Record production completion metadata
+// Called from the approveProduction / ProductionUploadPanel submit flow.
+// ─────────────────────────────────────────────────────────────────────────────
+materialIssueSchema.methods.applyProductionCompletion = function ({
+  machine_name              = "",
+  ink_used                  = [],
+  ink_notes                 = "",
+  production_started_at     = null,
+  production_completed_at   = null,
+  production_duration_seconds = 0,
+}) {
+  this.machine_name              = machine_name;
+  this.ink_used                  = ink_used;
+  this.ink_notes                 = ink_notes;
+  this.production_started_at     = production_started_at
+    ? new Date(production_started_at)
+    : null;
+  this.production_completed_at   = production_completed_at
+    ? new Date(production_completed_at)
+    : new Date();
+
+  const secs = parseInt(production_duration_seconds, 10) || 0;
+  this.production_duration_seconds = secs;
+  this.production_duration_display = this.constructor.secsToDisplay(secs);
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Instance: Apply return data and compute all wastage fields
@@ -267,7 +320,7 @@ materialIssueSchema.methods.applyReturn = function ({
   const wastage_ratio    = issued > 0
     ? parseFloat(((actual_wastage / issued) * 100).toFixed(2))
     : 0;
-  const performance      = ratePerformance(wastage_ratio);
+  const performance = ratePerformance(wastage_ratio);
 
   this.return = {
     returned_qty,
@@ -294,8 +347,8 @@ materialIssueSchema.methods.applyReturn = function ({
 // ─────────────────────────────────────────────────────────────────────────────
 materialIssueSchema.methods.applyManagerReview = function ({
   manager_by,
-  manager_notes  = "",
-  override_rating = null,  // manager can override auto-rating if context warrants
+  manager_notes   = "",
+  override_rating = null,
 }) {
   if (!this.return) throw new Error("Cannot review before return is recorded.");
 

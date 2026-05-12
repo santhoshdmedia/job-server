@@ -1,3 +1,4 @@
+const { sortedUniq } = require("lodash");
 const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
@@ -138,9 +139,15 @@ const jobCartItemSchema = new Schema(
     printing_type: { type: String },
     variation: { type: String },
     quantity: { type: Number, min: 1 },
+    quantity_type: { type: String, default: "pcs" },
     price: { type: Number, min: 0 },
     design_file: { type: String, default: "" },
     size: { type: String, default: "" },
+    height: { type: String, default: "" },
+    width: { type: String, default: "" },
+    size_unit: { type: String, default: "" },
+    sq_ft: { type: String, default: "" },
+    gst_percentage: { type: Number, default: 0 },
     notes: { type: String, default: "" },
   },
   { _id: false },
@@ -248,6 +255,7 @@ const jobSchema = new Schema(
     gst_no: { type: String, default: "" },
     payment_mode: { type: String, default: "" },
     payment_amount: { type: String, default: "" },
+    design_charges: { type: Number, default: 0 },
     valid_until: { type: Date, required: true },
     notes: { type: String, default: "" },
     terms_and_conditions: { type: String, default: "" },
@@ -511,7 +519,5 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
     .lean();
 };
 
-// ════════════════════════════════════════════════════════════════════════════
-// Model Export
-// ════════════════════════════════════════════════════════════════════════════
+
 module.exports = mongoose.models.job || mongoose.model("job", jobSchema);

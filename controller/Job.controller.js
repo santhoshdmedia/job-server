@@ -299,7 +299,7 @@ exports.openSession = async (req, res) => {
     const summary = job.getSessionSummary(stage);
     return resp(res, 200, true, `Session opened for stage "${stage}" on job ${job.job_no}.`, {
       job_no:        job.job_no,
-      job_status:    job.job_status,
+      job_status:    job.job_status,  
       stage_summary: summary,
     });
   } catch (err) {
@@ -500,7 +500,6 @@ exports.completeStage = async (req, res) => {
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
-      job.job_status = next_stage === "quality_check" ? "quality_check" : "in_progress";
     } else {
       job.job_status = "completed";
     }
@@ -865,7 +864,6 @@ exports.passQC = async (req, res) => {
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
-      job.job_status = "in_progress";
     } else {
       job.job_status = "passed";
     }
