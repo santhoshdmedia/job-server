@@ -4,6 +4,7 @@ const job_routers = require("./job.route");
 const product_routers = require("./product.routers");
 const staff_routers = require("./staff.route");
 const meterial_routers = require("./Material_issue.route");
+const Inforequest_routes = require("./Inforequest.routes");
 // const user_routers = require("./user.routers");
 // const product_routers = require("./product.routers");
 
@@ -17,7 +18,8 @@ module.exports = {
   job_routers,
   product_routers,
   staff_routers,
-  meterial_routers
+  meterial_routers,
+  Inforequest_routes
 
   // user_routers,
   // product_routers

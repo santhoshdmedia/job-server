@@ -1,7 +1,10 @@
 // ==================== JOB CONTROLLER ====================
+// RULE: openSession / closeSession (model helpers) NEVER touch job_status.
+//       Only the controllers that own an explicit status transition
+//       (approveJob, updateJobStatus, failQC, convertToOrder, …) set it.
 
-const mongoose = require("mongoose");
-const Job = require("../modals/job.modal");
+const mongoose  = require("mongoose");
+const Job       = require("../modals/job.modal");
 const AdminUsers = require("../modals/adminusers.modals");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +20,7 @@ const VALID_STATUSES = [
 // ─────────────────────────────────────────────────────────────────────────────
 const generateJobNo = async () => {
   const prefix = "DM";
-  const last = await Job.findOne({ job_no: new RegExp(`^${prefix}\\d+$`) })
+  const last   = await Job.findOne({ job_no: new RegExp(`^${prefix}\\d+$`) })
     .sort({ job_no: -1 })
     .select("job_no")
     .lean();
@@ -41,7 +44,7 @@ const resp = (res, status, success, message, data = null) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createJob = async (req, res) => {
   try {
-    const job_no = await generateJobNo();
+    const job_no  = await generateJobNo();
     const jobData = await Job.create({ ...req.body, job_no });
     return resp(res, 201, true, "Job created successfully.", jobData);
   } catch (err) {
@@ -140,7 +143,7 @@ exports.updateJob = async (req, res) => {
     const job = await Job.findByIdAndUpdate(
       req.params.id,
       { $set: updates },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     ).lean();
 
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -152,17 +155,22 @@ exports.updateJob = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. UPDATE JOB STATUS
+// 5. UPDATE JOB STATUS  ← explicit status controller
 // PATCH /api/jobs/:id/status
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateJobStatus = async (req, res) => {
   try {
     const { job_status } = req.body;
+
+    if (!job_status || !VALID_STATUSES.includes(job_status))
+      return resp(res, 400, false, `job_status must be one of: ${VALID_STATUSES.join(", ")}.`);
+
     const job = await Job.findByIdAndUpdate(
       req.params.id,
       { $set: { job_status, status_updated_at: new Date() } },
-      { new: true }
+      { new: true },
     ).lean();
+
     if (!job) return resp(res, 404, false, "Job not found.");
     return resp(res, 200, true, `Job status updated to "${job_status}".`, job);
   } catch (err) {
@@ -172,7 +180,7 @@ exports.updateJobStatus = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. APPROVE JOB
+// 6. APPROVE JOB  ← explicit status controller (sets accepted)
 // POST /api/jobs/:id/approve
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveJob = async (req, res) => {
@@ -195,6 +203,7 @@ exports.approveJob = async (req, res) => {
 
     const now = new Date();
 
+    // Explicit status transition owned by this controller
     job.job_status           = job_status || "accepted";
     job.approved_by          = approved_by;
     job.approved_by_admin_id = approved_by_admin_id;
@@ -263,8 +272,8 @@ exports.assignJob = async (req, res) => {
       since:        now,
     };
     job.status_updated_at = now;
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, `Job assigned to ${assigned_to.name} at stage "${stage}".`, job);
   } catch (err) {
     console.error("assignJob:", err);
@@ -275,6 +284,7 @@ exports.assignJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. OPEN SESSION
 // POST /api/jobs/:id/session/open
+// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.openSession = async (req, res) => {
   try {
@@ -293,13 +303,14 @@ exports.openSession = async (req, res) => {
       );
     }
 
+    // openSession does NOT change job_status
     job.openSession({ stageName: stage, stageLabel: stage_label, user, notes });
     await job.save();
 
     const summary = job.getSessionSummary(stage);
     return resp(res, 200, true, `Session opened for stage "${stage}" on job ${job.job_no}.`, {
       job_no:        job.job_no,
-      job_status:    job.job_status,  
+      job_status:    job.job_status,
       stage_summary: summary,
     });
   } catch (err) {
@@ -311,6 +322,7 @@ exports.openSession = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. CLOSE SESSION
 // POST /api/jobs/:id/session/close
+// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.closeSession = async (req, res) => {
   try {
@@ -322,6 +334,7 @@ exports.closeSession = async (req, res) => {
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
+    // closeSession does NOT change job_status
     job.closeSession({ stageName: stage, action, notes });
     await job.save();
 
@@ -346,7 +359,7 @@ exports.closeSession = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 10. GET SESSION STATUS
-// GET /api/jobs/:id/session/status?stage=quality_check
+// GET /api/jobs/:id/session/status?stage=design
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getSessionStatus = async (req, res) => {
   try {
@@ -430,8 +443,9 @@ exports.getSessionStatus = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 11. START JOB (legacy)
+// 11. START JOB (open a session for a stage)
 // POST /api/jobs/:id/start
+// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.startJob = async (req, res) => {
   try {
@@ -444,6 +458,13 @@ exports.startJob = async (req, res) => {
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
+    if (job.hasOpenSession(stage)) {
+      return resp(res, 409, false,
+        `A session for stage "${stage}" is already open on job ${job.job_no}. Close it first.`
+      );
+    }
+
+    // openSession does NOT change job_status
     job.openSession({
       stageName: stage,
       user: { user_id: handled_by.user_id, name: handled_by.name, role: handled_by.role || "" },
@@ -451,7 +472,12 @@ exports.startJob = async (req, res) => {
     });
     await job.save();
 
-    return resp(res, 200, true, "Job marked as started.", job);
+    const summary = job.getSessionSummary(stage);
+    return resp(res, 200, true, `Job session started for stage "${stage}".`, {
+      job_no:        job.job_no,
+      job_status:    job.job_status,
+      stage_summary: summary,
+    });
   } catch (err) {
     console.error("startJob:", err);
     return resp(res, 500, false, err.message);
@@ -459,8 +485,9 @@ exports.startJob = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 12. COMPLETE STAGE & HANDOFF
+// 12. COMPLETE STAGE
 // POST /api/jobs/:id/complete-stage
+// Sets job_status = "completed" only when there is no next_stage.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.completeStage = async (req, res) => {
   try {
@@ -475,6 +502,8 @@ exports.completeStage = async (req, res) => {
 
     const now        = new Date();
     const stageEntry = job.getActiveStage(stage);
+
+    // Close the session (no status change inside closeSession)
     if (stageEntry) job.closeSession({ stageName: stage, action: "completed", notes });
 
     if (next_stage) {
@@ -500,11 +529,13 @@ exports.completeStage = async (req, res) => {
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
+      // job_status intentionally not changed — caller can set it via PATCH /status
     } else {
-      job.job_status = "completed";
+      // No next stage — explicit terminal decision owned by this controller
+      job.job_status        = "completed";
+      job.status_updated_at = now;
     }
 
-    job.status_updated_at = now;
     await job.save();
 
     const message = next_stage
@@ -521,6 +552,8 @@ exports.completeStage = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 13. PUT JOB ON HOLD
 // POST /api/jobs/:id/hold
+// Closes the open session only — does NOT change job_status.
+// Use PATCH /api/jobs/:id/status to change status separately.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.holdJob = async (req, res) => {
   try {
@@ -532,16 +565,18 @@ exports.holdJob = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
 
     if (job.hasOpenSession(stage)) {
+      // closeSession does NOT change job_status
       job.closeSession({ stageName: stage, action: "on_hold", notes });
     } else {
       const stageEntry = job.getActiveStage(stage);
       if (stageEntry) stageEntry.action = "on_hold";
-      job.job_status        = "on_hold";
-      job.status_updated_at = new Date();
     }
 
     await job.save();
-    return resp(res, 200, true, "Job placed on hold.", job);
+    return resp(res, 200, true, "Job session placed on hold (use PATCH /status to change job status).", {
+      job_no:     job.job_no,
+      job_status: job.job_status,
+    });
   } catch (err) {
     console.error("holdJob:", err);
     return resp(res, 500, false, err.message);
@@ -551,6 +586,8 @@ exports.holdJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 14. REJECT JOB AT STAGE
 // POST /api/jobs/:id/reject
+// Closes the open session only — does NOT change job_status.
+// Use PATCH /api/jobs/:id/status to change status separately.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.rejectJob = async (req, res) => {
   try {
@@ -562,6 +599,7 @@ exports.rejectJob = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
 
     if (job.hasOpenSession(stage)) {
+      // closeSession does NOT change job_status
       job.closeSession({ stageName: stage, action: "rejected", notes });
     } else {
       const stageEntry = job.getActiveStage(stage);
@@ -569,12 +607,13 @@ exports.rejectJob = async (req, res) => {
         stageEntry.action       = "rejected";
         stageEntry.completed_at = new Date();
       }
-      job.job_status        = "rejected";
-      job.status_updated_at = new Date();
     }
 
     await job.save();
-    return resp(res, 200, true, "Job rejected.", job);
+    return resp(res, 200, true, "Job stage rejected (use PATCH /status to change job status).", {
+      job_no:     job.job_no,
+      job_status: job.job_status,
+    });
   } catch (err) {
     console.error("rejectJob:", err);
     return resp(res, 500, false, err.message);
@@ -584,6 +623,7 @@ exports.rejectJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 15. UPLOAD DESIGN FILE
 // POST /api/jobs/:id/upload_design
+// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.uploadDesign = async (req, res) => {
   try {
@@ -620,6 +660,7 @@ exports.uploadDesign = async (req, res) => {
     job.design_status           = "uploaded";
     job.design_is_sample        = is_sample === true || is_sample === "true";
 
+    // Close the session — does NOT change job_status
     if (job.hasOpenSession(stage))
       job.closeSession({ stageName: stage, action: "completed", notes });
 
@@ -643,7 +684,7 @@ exports.uploadDesign = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveDesign = async (req, res) => {
   try {
-    const { handled_by, design_file,drive_link } = req.body;
+    const { handled_by, design_file, drive_link } = req.body;
 
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -651,10 +692,10 @@ exports.approveDesign = async (req, res) => {
     job.design_status      = "approved";
     job.design_approved_at = new Date();
     job.design_approved_by = handled_by?.user_id || "Admin";
-    if (design_file) job.design_file = design_file;
-    if (drive_link) job.design_drive_link = drive_link;
-    await job.save();
+    if (design_file) job.design_file      = design_file;
+    if (drive_link)  job.design_drive_link = drive_link;
 
+    await job.save();
     return resp(res, 200, true, "Design approved.", { design_status: job.design_status });
   } catch (err) {
     console.error("approveDesign:", err);
@@ -677,8 +718,8 @@ exports.approveProduction = async (req, res) => {
     job.production_approved_at = new Date();
     job.production_approved_by = handled_by?.user_id || "Admin";
     if (productionimg) job.productionimg = productionimg;
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, "Production approved.", { production_status: job.production_status });
   } catch (err) {
     console.error("approveProduction:", err);
@@ -687,7 +728,7 @@ exports.approveProduction = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 16c. APPROVE QC (legacy single-image)
+// 16c. APPROVE QC
 // POST /api/jobs/:id/approve_qc
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveqc = async (req, res) => {
@@ -701,8 +742,8 @@ exports.approveqc = async (req, res) => {
     job.qc_approved_at = new Date();
     job.qc_approved_by = handled_by?.user_id || "Admin";
     if (qcimg) job.qcimg = qcimg;
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, "QC approved.", { qc_status: job.qc_status });
   } catch (err) {
     console.error("approveQC:", err);
@@ -725,8 +766,8 @@ exports.rejectDesign = async (req, res) => {
 
     job.design_status           = "rejected";
     job.design_rejection_reason = notes;
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, "Design rejected with feedback.", {
       design_status:           job.design_status,
       design_rejection_reason: job.design_rejection_reason,
@@ -738,14 +779,9 @@ exports.rejectDesign = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 18. UPDATE QC — save photos (S3 URLs or local files) + notes
+// 18. UPDATE QC
 // POST /api/jobs/:id/qc/update
-//
-// Accepts EITHER:
-//   • JSON body:      { qc_images: ["https://s3.aws.../photo.jpg", ...], qc_notes, duration_seconds, duration_display, handled_by }
-//   • multipart:      qc_images[] files + qc_notes etc. (legacy multer upload)
-//
-// NEW images are APPENDED to existing ones (not replaced).
+// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateQC = async (req, res) => {
   try {
@@ -756,11 +792,10 @@ exports.updateQC = async (req, res) => {
       qc_notes         = "",
       duration_seconds = 0,
       duration_display = "00:00:00",
-      qc_images        = [],   // array of S3 URL strings sent from React frontend
+      qc_images        = [],
       handled_by       = {},
     } = req.body;
 
-    // ── Resolve handled_by (may arrive as JSON string in form-data)
     let handledByObj = {};
     if (typeof handled_by === "string") {
       try { handledByObj = JSON.parse(handled_by); } catch { handledByObj = {}; }
@@ -768,7 +803,6 @@ exports.updateQC = async (req, res) => {
       handledByObj = handled_by;
     }
 
-    // ── Collect incoming S3 URL strings (JSON body path)
     let incomingUrls = [];
     if (Array.isArray(qc_images)) {
       incomingUrls = qc_images.filter(Boolean);
@@ -776,16 +810,8 @@ exports.updateQC = async (req, res) => {
       try { incomingUrls = JSON.parse(qc_images).filter(Boolean); } catch { /* ignore */ }
     }
 
-    // ── Collect any uploaded local files (multipart path — legacy / fallback)
     const uploadedFilePaths = (req.files || []).map((f) => `/uploads/qc/${f.filename}`);
-
-    // ── Merge: keep existing + append new S3 URLs + append any local uploads
-    const merged = [
-      ...(job.qc_images || []),
-      ...incomingUrls,
-      ...uploadedFilePaths,
-    ];
-    // Deduplicate while preserving order
+    const merged = [...(job.qc_images || []), ...incomingUrls, ...uploadedFilePaths];
     job.qc_images = [...new Set(merged)];
     job.qc_notes  = qc_notes;
 
@@ -812,9 +838,8 @@ exports.updateQC = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 19. PASS QC
+// 19. PASS QC  ← explicit status controller (sets passed when no next_stage)
 // POST /api/jobs/:id/qc/pass
-// Body: { handled_by, notes, next_stage?, next_assigned_to? }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.passQC = async (req, res) => {
   try {
@@ -828,7 +853,7 @@ exports.passQC = async (req, res) => {
 
     const now = new Date();
 
-    // Close QC session if open
+    // Close QC session — does NOT change job_status
     if (job.hasOpenSession("quality_check"))
       job.closeSession({ stageName: "quality_check", action: "completed", notes });
 
@@ -854,21 +879,19 @@ exports.passQC = async (req, res) => {
         stage:                  next_stage,
         stage_label:            next_stage,
         stage_action:           "assigned",
-        assigned_to: {
-          user_id: assignedTo.user_id,
-          name:    assignedTo.name,
-          role:    assignedTo.role || "",
-        },
+        assigned_to:            { user_id: assignedTo.user_id, name: assignedTo.name, role: assignedTo.role || "" },
         since:                  now,
         total_duration_seconds: 0,
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
+      // job_status intentionally not changed — caller can set it via PATCH /status
     } else {
-      job.job_status = "passed";
+      // No next stage — explicit terminal decision owned by this controller
+      job.job_status        = "passed";
+      job.status_updated_at = now;
     }
 
-    job.status_updated_at = now;
     await job.save();
 
     const message = next_stage
@@ -883,9 +906,8 @@ exports.passQC = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 20. FAIL QC
+// 20. FAIL QC  ← explicit status controller (always sets failed)
 // POST /api/jobs/:id/qc/fail
-// Body: { handled_by, reason, notes? }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.failQC = async (req, res) => {
   try {
@@ -901,6 +923,7 @@ exports.failQC = async (req, res) => {
 
     const now = new Date();
 
+    // Close QC session — does NOT change job_status inside closeSession
     if (job.hasOpenSession("quality_check")) {
       job.closeSession({ stageName: "quality_check", action: "failed", notes });
     } else {
@@ -909,10 +932,11 @@ exports.failQC = async (req, res) => {
         stageEntry.action       = "failed";
         stageEntry.completed_at = now;
       }
-      job.job_status        = "failed";
-      job.status_updated_at = now;
     }
 
+    // Explicit terminal decision — owned by this controller
+    job.job_status          = "failed";
+    job.status_updated_at   = now;
     job.qc_status           = "failed";
     job.qc_rejection_reason = reason;
     job.qc_inspected_by     = handled_by.name;
@@ -995,7 +1019,7 @@ exports.getJobsAssignedToUser = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 23. CONVERT JOB TO ORDER
+// 23. CONVERT JOB TO ORDER  ← explicit status controller
 // POST /api/jobs/:id/convert
 // ─────────────────────────────────────────────────────────────────────────────
 exports.convertToOrder = async (req, res) => {
@@ -1065,4 +1089,4 @@ exports.restoreJob = async (req, res) => {
     console.error("restoreJob:", err);
     return resp(res, 500, false, err.message);
   }
-};
+};    
