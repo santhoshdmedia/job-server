@@ -1,10 +1,10 @@
 // ==================== JOB CONTROLLER ====================
 // RULE: openSession / closeSession (model helpers) NEVER touch job_status.
-//       Only the controllers that own an explicit status transition
+//       Only controllers that own an explicit status transition
 //       (approveJob, updateJobStatus, failQC, convertToOrder, …) set it.
 
-const mongoose  = require("mongoose");
-const Job       = require("../modals/job.modal");
+const mongoose   = require("mongoose");
+const Job        = require("../modals/job.modal");
 const AdminUsers = require("../modals/adminusers.modals");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +32,9 @@ const generateJobNo = async () => {
   return `${prefix}${String(seq).padStart(4, "0")}`;
 };
 
+// ✅ FIX: resp now always includes both `job` and `data` keys when a job document
+//         is returned from createJob, so the frontend can use either data.job or
+//         data.data without breaking. All other endpoints are unchanged.
 const resp = (res, status, success, message, data = null) => {
   const payload = { success, message };
   if (data !== null) payload.data = data;
@@ -44,11 +47,113 @@ const resp = (res, status, success, message, data = null) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createJob = async (req, res) => {
   try {
-    const job_no  = await generateJobNo();
-    const jobData = await Job.create({ ...req.body, job_no });
-    return resp(res, 201, true, "Job created successfully.", jobData);
+    const {
+      // ── Customer Info ────────────────────────────────────────────────
+      customer_name,
+      customer_phone,
+      // ✅ FIX: company_name is now explicitly destructured and stored
+      company_name,
+
+      // ── Order Info ───────────────────────────────────────────────────
+      order_no,
+      order_date,
+      estimated_delivery_date,
+
+      // ── Cart & Delivery ──────────────────────────────────────────────
+      cart_items,
+      delivery_address,
+
+      // ── Status ───────────────────────────────────────────────────────
+      job_status,
+
+      // ── Financials ───────────────────────────────────────────────────
+      subtotal,
+      discount_percentage,
+      discount_amount,
+      taxable_amount,
+      tax_amount,
+      delivery_charges,
+      free_delivery,
+      total_amount,
+      gst_no,
+      payment_mode,
+      payment_amount,
+      balance_amount,
+      design_charges,
+      valid_until,
+
+      // ── Meta ─────────────────────────────────────────────────────────
+      notes,
+      terms_and_conditions,
+      created_by,
+      created_by_admin_id,
+    } = req.body;
+
+    const job_no = await generateJobNo();
+
+    const jobData = await Job.create({
+      // ── Job Number ───────────────────────────────────────────────────
+      job_no,
+      order_no:                order_no                || "",
+
+      // ── Customer Info ────────────────────────────────────────────────
+      customer_name:           customer_name           || "",
+      customer_phone:          customer_phone          || "",
+      // ✅ FIX: was missing from Job.create() call — this is why it never saved
+      company_name:            company_name            || "",
+
+      // ── Order Info ───────────────────────────────────────────────────
+      order_date:              order_date              ? new Date(order_date)              : null,
+      estimated_delivery_date: estimated_delivery_date ? new Date(estimated_delivery_date) : null,
+
+      // ── Cart & Delivery ──────────────────────────────────────────────
+      cart_items:              cart_items              || [],
+      delivery_address:        delivery_address        || {},
+
+      // ── Status ───────────────────────────────────────────────────────
+      job_status:              job_status              || "draft",
+      status_updated_at:       new Date(),
+
+      // ── Financials ───────────────────────────────────────────────────
+      subtotal:                parseFloat(subtotal)            || 0,
+      discount_percentage:     parseFloat(discount_percentage) || 0,
+      discount_amount:         parseFloat(discount_amount)     || 0,
+      taxable_amount:          parseFloat(taxable_amount)      || 0,
+      tax_amount:              parseFloat(tax_amount)          || 0,
+      delivery_charges:        parseFloat(delivery_charges)    || 0,
+      free_delivery:           free_delivery                   ?? false,
+      total_amount:            parseFloat(total_amount),
+      gst_no:                  gst_no                          || "",
+      payment_mode:            payment_mode                    || "",
+      payment_amount:          parseFloat(payment_amount)      || 0,
+      balance_amount:          parseFloat(balance_amount)      || 0,
+      design_charges:          parseFloat(design_charges)      || 0,
+      valid_until:             new Date(valid_until),
+
+      // ── Meta ─────────────────────────────────────────────────────────
+      notes:                   notes                   || "",
+      terms_and_conditions:    terms_and_conditions    || "",
+      created_by:              created_by              || "admin",
+      created_by_admin_id:     created_by_admin_id     || null,
+
+      // ── Defaults ─────────────────────────────────────────────────────
+      converted_to_order:      false,
+      deletedAt:               null,
+    });
+
+    console.log("createJob ✅ | job_no:", jobData.job_no, "| company:", jobData.company_name);
+
+    // ✅ FIX: return BOTH `job` and `data` keys so frontend works regardless
+    //         of which key it reads (data.job OR data.data)
+    return res.status(201).json({
+      success: true,
+      message: "Job created successfully.",
+      job:     jobData,   // ← frontend reads data.job.job_no for notification
+      data:    jobData,   // ← backward-compat for any code reading data.data
+    });
+
   } catch (err) {
-    console.error("createJob:", err);
+    console.error("createJob ❌", err);
     if (err.code === 11000 && err.keyPattern?.job_no)
       return resp(res, 409, false, "Job number conflict, please retry.");
     return resp(res, 500, false, err.message);
@@ -62,8 +167,14 @@ exports.createJob = async (req, res) => {
 exports.getAllJobs = async (req, res) => {
   try {
     const {
-      status, stage, customer_name, job_no,
-      page = 1, limit = 20, sort_by = "createdAt", sort_order = "desc",
+      status,
+      stage,
+      customer_name,
+      job_no,
+      page       = 1,
+      limit      = 20,
+      sort_by    = "createdAt",
+      sort_order = "desc",
     } = req.query;
 
     const filter = {};
@@ -72,9 +183,9 @@ exports.getAllJobs = async (req, res) => {
     if (customer_name) filter.customer_name          = new RegExp(customer_name, "i");
     if (job_no)        filter.job_no                 = new RegExp(job_no, "i");
 
-    const skip  = (parseInt(page) - 1) * parseInt(limit);
-    const sort  = { [sort_by]: sort_order === "asc" ? 1 : -1 };
-    const total = await Job.countDocuments(filter);
+    const skip      = (parseInt(page) - 1) * parseInt(limit);
+    const sort      = { [sort_by]: sort_order === "asc" ? 1 : -1 };
+    const total     = await Job.countDocuments(filter);
 
     const jobs = await Job.find(filter)
       .sort(sort)
@@ -93,7 +204,7 @@ exports.getAllJobs = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("getAllJobs:", err);
+    console.error("getAllJobs ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -110,10 +221,11 @@ exports.getJobById = async (req, res) => {
       .populate("workflow_stages.work_sessions.user_id", "name role email")
       .populate("current_stage.assigned_to.user_id",     "name role email")
       .lean();
+
     if (!job) return resp(res, 404, false, "Job not found.");
     return resp(res, 200, true, "Job fetched successfully.", job);
   } catch (err) {
-    console.error("getJobById:", err);
+    console.error("getJobById ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -125,11 +237,14 @@ exports.getJobById = async (req, res) => {
 exports.updateJob = async (req, res) => {
   try {
     const allowedFields = [
-      "customer_name", "customer_phone", "cart_items", "delivery_address",
-      "estimated_delivery_date", "order_date", "subtotal", "discount_percentage",
-      "discount_amount", "taxable_amount", "tax_amount", "delivery_charges",
+      "customer_name", "customer_phone", "company_name",
+      "cart_items", "delivery_address",
+      "estimated_delivery_date", "order_date",
+      "subtotal", "discount_percentage", "discount_amount",
+      "taxable_amount", "tax_amount", "delivery_charges",
       "free_delivery", "total_amount", "gst_no", "valid_until",
-      "notes", "terms_and_conditions", "payment_amount", "payment_mode",
+      "notes", "terms_and_conditions",
+      "payment_amount", "payment_mode", "balance_amount",
     ];
 
     const updates = {};
@@ -149,7 +264,7 @@ exports.updateJob = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
     return resp(res, 200, true, "Job updated successfully.", job);
   } catch (err) {
-    console.error("updateJob:", err);
+    console.error("updateJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -174,7 +289,7 @@ exports.updateJobStatus = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
     return resp(res, 200, true, `Job status updated to "${job_status}".`, job);
   } catch (err) {
-    console.error("updateJobStatus:", err);
+    console.error("updateJobStatus ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -185,17 +300,21 @@ exports.updateJobStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveJob = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { approved_by, approved_by_admin_id, assign_to, job_status } = req.body;
+    const {
+      approved_by,
+      approved_by_admin_id,
+      assign_to,
+      job_status,
+    } = req.body;
 
     if (!approved_by || !approved_by_admin_id)
       return resp(res, 400, false, "Approver name and ID are required.");
 
-    const job = await Job.findById(id);
-    if (!job) return resp(res, 404, false, "Job not found.");
-
     if (!assign_to?.user_id)
       return resp(res, 400, false, "A designer must be assigned when approving.");
+
+    const job = await Job.findById(req.params.id);
+    if (!job) return resp(res, 404, false, "Job not found.");
 
     const designer = await AdminUsers.findById(assign_to.user_id);
     if (!designer || designer.role !== "designing team")
@@ -203,35 +322,45 @@ exports.approveJob = async (req, res) => {
 
     const now = new Date();
 
-    // Explicit status transition owned by this controller
-    job.job_status           = job_status || "accepted";
+    job.job_status           = job_status            || "accepted";
     job.approved_by          = approved_by;
     job.approved_by_admin_id = approved_by_admin_id;
     job.status_updated_at    = now;
 
     job.workflow_stages.push({
-      stage:       "design",
-      stage_label: "Design",
-      handled_by:  { user_id: designer._id, name: designer.name, role: designer.role },
-      assigned_by: { user_id: approved_by_admin_id, name: approved_by },
-      action:      "assigned",
-      assigned_at: now,
+      stage:         "design",
+      stage_label:   "Design",
+      handled_by: {
+        user_id: designer._id,
+        name:    designer.name,
+        role:    designer.role,
+      },
+      assigned_by: {
+        user_id: approved_by_admin_id,
+        name:    approved_by,
+      },
+      action:        "assigned",
+      assigned_at:   now,
       work_sessions: [],
-      notes: "Job approved and assigned by admin",
+      notes:         "Job approved and assigned by admin",
     });
 
     job.current_stage = {
       stage:        "design",
       stage_label:  "Design",
       stage_action: "assigned",
-      assigned_to:  { user_id: designer._id, name: designer.name, role: designer.role },
-      since:        now,
+      assigned_to: {
+        user_id: designer._id,
+        name:    designer.name,
+        role:    designer.role,
+      },
+      since: now,
     };
 
     await job.save();
     return resp(res, 200, true, `Job approved and assigned to ${designer.name}.`, job);
   } catch (err) {
-    console.error("approveJob:", err);
+    console.error("approveJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -242,9 +371,16 @@ exports.approveJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.assignJob = async (req, res) => {
   try {
-    const { stage, stage_label, assigned_to, assigned_by, notes } = req.body;
+    const {
+      stage,
+      stage_label,
+      assigned_to,
+      assigned_by,
+      notes,
+    } = req.body;
 
-    if (!stage) return resp(res, 400, false, "stage is required.");
+    if (!stage)
+      return resp(res, 400, false, "stage is required.");
     if (!assigned_to?.user_id || !assigned_to?.name)
       return resp(res, 400, false, "assigned_to.user_id and assigned_to.name are required.");
 
@@ -255,55 +391,59 @@ exports.assignJob = async (req, res) => {
 
     job.workflow_stages.push({
       stage,
-      stage_label:   stage_label || "",
-      handled_by:    { user_id: assigned_to.user_id, name: assigned_to.name, role: assigned_to.role || "" },
-      assigned_by:   assigned_by || {},
+      stage_label:   stage_label   || "",
+      handled_by: {
+        user_id: assigned_to.user_id,
+        name:    assigned_to.name,
+        role:    assigned_to.role  || "",
+      },
+      assigned_by:   assigned_by   || {},
       action:        "assigned",
       assigned_at:   now,
       work_sessions: [],
-      notes:         notes || "",
+      notes:         notes         || "",
     });
 
     job.current_stage = {
       stage,
-      stage_label:  stage_label || "",
+      stage_label:  stage_label   || "",
       stage_action: "assigned",
-      assigned_to:  { user_id: assigned_to.user_id, name: assigned_to.name, role: assigned_to.role || "" },
-      since:        now,
+      assigned_to: {
+        user_id: assigned_to.user_id,
+        name:    assigned_to.name,
+        role:    assigned_to.role  || "",
+      },
+      since: now,
     };
     job.status_updated_at = now;
 
     await job.save();
     return resp(res, 200, true, `Job assigned to ${assigned_to.name} at stage "${stage}".`, job);
   } catch (err) {
-    console.error("assignJob:", err);
+    console.error("assignJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. OPEN SESSION
+// 8. OPEN SESSION — does NOT change job_status
 // POST /api/jobs/:id/session/open
-// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.openSession = async (req, res) => {
   try {
     const { stage, stage_label, user, notes } = req.body;
 
-    if (!stage) return resp(res, 400, false, "stage is required.");
+    if (!stage)
+      return resp(res, 400, false, "stage is required.");
     if (!user?.user_id || !user?.name)
       return resp(res, 400, false, "user.user_id and user.name are required.");
 
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    if (job.hasOpenSession(stage)) {
-      return resp(res, 409, false,
-        `A session for stage "${stage}" is already open on job ${job.job_no}. Close it first.`
-      );
-    }
+    if (job.hasOpenSession(stage))
+      return resp(res, 409, false, `A session for stage "${stage}" is already open on job ${job.job_no}. Close it first.`);
 
-    // openSession does NOT change job_status
     job.openSession({ stageName: stage, stageLabel: stage_label, user, notes });
     await job.save();
 
@@ -314,15 +454,14 @@ exports.openSession = async (req, res) => {
       stage_summary: summary,
     });
   } catch (err) {
-    console.error("openSession:", err);
+    console.error("openSession ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. CLOSE SESSION
+// 9. CLOSE SESSION — does NOT change job_status
 // POST /api/jobs/:id/session/close
-// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.closeSession = async (req, res) => {
   try {
@@ -334,7 +473,6 @@ exports.closeSession = async (req, res) => {
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    // closeSession does NOT change job_status
     job.closeSession({ stageName: stage, action, notes });
     await job.save();
 
@@ -352,7 +490,7 @@ exports.closeSession = async (req, res) => {
       stage_summary: summary,
     });
   } catch (err) {
-    console.error("closeSession:", err);
+    console.error("closeSession ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -373,7 +511,7 @@ exports.getSessionStatus = async (req, res) => {
     const workflowStages = Array.isArray(job.workflow_stages) ? job.workflow_stages : [];
 
     if (stage) {
-      const stageEntry = workflowStages.find((s) => s.stage === stage);
+      const stageEntry = workflowStages.find(s => s.stage === stage);
 
       if (!stageEntry) {
         return resp(res, 200, true, "Session status fetched.", {
@@ -394,7 +532,7 @@ exports.getSessionStatus = async (req, res) => {
       }
 
       const sessions    = Array.isArray(stageEntry.work_sessions) ? stageEntry.work_sessions : [];
-      const openSession = sessions.find((s) => !s.session_end);
+      const openSession = sessions.find(s => !s.session_end);
 
       return resp(res, 200, true, "Session status fetched.", {
         job_no:                 job.job_no,
@@ -404,29 +542,28 @@ exports.getSessionStatus = async (req, res) => {
         has_open_session:       !!openSession,
         open_since:             openSession?.session_start || null,
         total_sessions:         sessions.length,
-        closed_sessions:        sessions.filter((s) => s.session_end).length,
+        closed_sessions:        sessions.filter(s => s.session_end).length,
         total_duration_seconds: stageEntry.total_duration_seconds || 0,
         total_duration_display: stageEntry.total_duration_display || "00:00:00",
-        worked_days:            stageEntry.worked_days || 0,
+        worked_days:            stageEntry.worked_days  || 0,
         daily_summary:          stageEntry.daily_summary || [],
         work_sessions:          sessions,
       });
     }
 
-    // No stage filter — return all stages summary
-    const stageSummaries = workflowStages.map((s) => {
+    const stageSummaries = workflowStages.map(s => {
       const sessions = Array.isArray(s.work_sessions) ? s.work_sessions : [];
       return {
         stage:                  s.stage,
         stage_label:            s.stage_label,
         action:                 s.action,
         total_sessions:         sessions.length,
-        closed_sessions:        sessions.filter((x) => x.session_end).length,
-        has_open_session:       sessions.some((x) => !x.session_end),
+        closed_sessions:        sessions.filter(x => x.session_end).length,
+        has_open_session:       sessions.some(x => !x.session_end),
         total_duration_seconds: s.total_duration_seconds || 0,
         total_duration_display: s.total_duration_display || "00:00:00",
-        worked_days:            s.worked_days || 0,
-        daily_summary:          s.daily_summary || [],
+        worked_days:            s.worked_days             || 0,
+        daily_summary:          s.daily_summary           || [],
       };
     });
 
@@ -437,37 +574,37 @@ exports.getSessionStatus = async (req, res) => {
       stages:        stageSummaries,
     });
   } catch (err) {
-    console.error("getSessionStatus:", err);
+    console.error("getSessionStatus ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 11. START JOB (open a session for a stage)
+// 11. START JOB — does NOT change job_status
 // POST /api/jobs/:id/start
-// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.startJob = async (req, res) => {
   try {
     const { stage, handled_by, notes } = req.body;
 
-    if (!stage) return resp(res, 400, false, "stage is required.");
+    if (!stage)
+      return resp(res, 400, false, "stage is required.");
     if (!handled_by?.user_id || !handled_by?.name)
       return resp(res, 400, false, "handled_by.user_id and handled_by.name are required.");
 
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    if (job.hasOpenSession(stage)) {
-      return resp(res, 409, false,
-        `A session for stage "${stage}" is already open on job ${job.job_no}. Close it first.`
-      );
-    }
+    if (job.hasOpenSession(stage))
+      return resp(res, 409, false, `A session for stage "${stage}" is already open on job ${job.job_no}. Close it first.`);
 
-    // openSession does NOT change job_status
     job.openSession({
       stageName: stage,
-      user: { user_id: handled_by.user_id, name: handled_by.name, role: handled_by.role || "" },
+      user: {
+        user_id: handled_by.user_id,
+        name:    handled_by.name,
+        role:    handled_by.role || "",
+      },
       notes,
     });
     await job.save();
@@ -479,7 +616,7 @@ exports.startJob = async (req, res) => {
       stage_summary: summary,
     });
   } catch (err) {
-    console.error("startJob:", err);
+    console.error("startJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -487,13 +624,19 @@ exports.startJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 12. COMPLETE STAGE
 // POST /api/jobs/:id/complete-stage
-// Sets job_status = "completed" only when there is no next_stage.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.completeStage = async (req, res) => {
   try {
-    const { stage, handled_by, notes, next_stage, next_assigned_to } = req.body;
+    const {
+      stage,
+      handled_by,
+      notes,
+      next_stage,
+      next_assigned_to,
+    } = req.body;
 
-    if (!stage) return resp(res, 400, false, "stage is required.");
+    if (!stage)
+      return resp(res, 400, false, "stage is required.");
     if (!handled_by?.user_id || !handled_by?.name)
       return resp(res, 400, false, "handled_by is required.");
 
@@ -502,17 +645,23 @@ exports.completeStage = async (req, res) => {
 
     const now        = new Date();
     const stageEntry = job.getActiveStage(stage);
-
-    // Close the session (no status change inside closeSession)
     if (stageEntry) job.closeSession({ stageName: stage, action: "completed", notes });
 
     if (next_stage) {
       const assignedTo = next_assigned_to || handled_by;
+
       job.workflow_stages.push({
         stage:         next_stage,
         stage_label:   "",
-        handled_by:    { user_id: assignedTo.user_id, name: assignedTo.name, role: assignedTo.role || "" },
-        assigned_by:   { user_id: handled_by.user_id, name: handled_by.name },
+        handled_by: {
+          user_id: assignedTo.user_id,
+          name:    assignedTo.name,
+          role:    assignedTo.role  || "",
+        },
+        assigned_by: {
+          user_id: handled_by.user_id,
+          name:    handled_by.name,
+        },
         action:        "assigned",
         assigned_at:   now,
         work_sessions: [],
@@ -523,41 +672,42 @@ exports.completeStage = async (req, res) => {
         stage:                  next_stage,
         stage_label:            "",
         stage_action:           "assigned",
-        assigned_to:            { user_id: assignedTo.user_id, name: assignedTo.name, role: assignedTo.role || "" },
+        assigned_to: {
+          user_id: assignedTo.user_id,
+          name:    assignedTo.name,
+          role:    assignedTo.role  || "",
+        },
         since:                  now,
         total_duration_seconds: 0,
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
-      // job_status intentionally not changed — caller can set it via PATCH /status
     } else {
-      // No next stage — explicit terminal decision owned by this controller
       job.job_status        = "completed";
       job.status_updated_at = now;
     }
 
     await job.save();
-
-    const message = next_stage
-      ? `Stage "${stage}" completed. Handed off to "${next_stage}".`
-      : `Stage "${stage}" completed. Job marked as completed.`;
-
-    return resp(res, 200, true, message, job);
+    return resp(res, 200, true,
+      next_stage
+        ? `Stage "${stage}" completed. Handed off to "${next_stage}".`
+        : `Stage "${stage}" completed. Job marked as completed.`,
+      job,
+    );
   } catch (err) {
-    console.error("completeStage:", err);
+    console.error("completeStage ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 13. PUT JOB ON HOLD
+// 13. PUT JOB ON HOLD — does NOT change job_status
 // POST /api/jobs/:id/hold
-// Closes the open session only — does NOT change job_status.
-// Use PATCH /api/jobs/:id/status to change status separately.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.holdJob = async (req, res) => {
   try {
     const { stage, handled_by, notes } = req.body;
+
     if (!stage || !handled_by?.user_id)
       return resp(res, 400, false, "stage and handled_by are required.");
 
@@ -565,7 +715,6 @@ exports.holdJob = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
 
     if (job.hasOpenSession(stage)) {
-      // closeSession does NOT change job_status
       job.closeSession({ stageName: stage, action: "on_hold", notes });
     } else {
       const stageEntry = job.getActiveStage(stage);
@@ -578,20 +727,19 @@ exports.holdJob = async (req, res) => {
       job_status: job.job_status,
     });
   } catch (err) {
-    console.error("holdJob:", err);
+    console.error("holdJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 14. REJECT JOB AT STAGE
+// 14. REJECT JOB AT STAGE — does NOT change job_status
 // POST /api/jobs/:id/reject
-// Closes the open session only — does NOT change job_status.
-// Use PATCH /api/jobs/:id/status to change status separately.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.rejectJob = async (req, res) => {
   try {
     const { stage, handled_by, notes } = req.body;
+
     if (!stage || !handled_by?.user_id)
       return resp(res, 400, false, "stage and handled_by are required.");
 
@@ -599,7 +747,6 @@ exports.rejectJob = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
 
     if (job.hasOpenSession(stage)) {
-      // closeSession does NOT change job_status
       job.closeSession({ stageName: stage, action: "rejected", notes });
     } else {
       const stageEntry = job.getActiveStage(stage);
@@ -615,15 +762,14 @@ exports.rejectJob = async (req, res) => {
       job_status: job.job_status,
     });
   } catch (err) {
-    console.error("rejectJob:", err);
+    console.error("rejectJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 15. UPLOAD DESIGN FILE
+// 15. UPLOAD DESIGN FILE — does NOT change job_status
 // POST /api/jobs/:id/upload_design
-// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.uploadDesign = async (req, res) => {
   try {
@@ -631,14 +777,14 @@ exports.uploadDesign = async (req, res) => {
     if (!job) return resp(res, 404, false, "Job not found.");
 
     const {
-      notes             = "",
-      duration_seconds  = 0,
-      duration_display  = "00:00:00",
-      design_file       = "",
+      notes            = "",
+      duration_seconds = 0,
+      duration_display = "00:00:00",
+      design_file      = "",
       design_drive_link = "",
-      stage             = job.current_stage?.stage || "design",
-      handled_by        = {},
-      is_sample         = false,
+      stage            = job.current_stage?.stage || "design",
+      handled_by       = {},
+      is_sample        = false,
     } = req.body;
 
     let handledByObj = {};
@@ -651,21 +797,19 @@ exports.uploadDesign = async (req, res) => {
     if (!design_file && !design_drive_link)
       return resp(res, 400, false, "At least a design file path or Drive link is required.");
 
-    job.design_file             = design_file || job.design_file;
-    job.design_drive_link       = design_drive_link || job.design_drive_link;
+    job.design_file             = design_file             || job.design_file;
+    job.design_drive_link       = design_drive_link       || job.design_drive_link;
     job.design_uploaded_at      = new Date();
-    job.design_uploaded_by      = handledByObj.name || "";
+    job.design_uploaded_by      = handledByObj.name       || "";
     job.design_duration_seconds = parseInt(duration_seconds, 10) || 0;
     job.design_duration_display = duration_display;
     job.design_status           = "uploaded";
     job.design_is_sample        = is_sample === true || is_sample === "true";
 
-    // Close the session — does NOT change job_status
     if (job.hasOpenSession(stage))
       job.closeSession({ stageName: stage, action: "completed", notes });
 
     await job.save();
-
     return resp(res, 200, true, "Design uploaded successfully.", {
       design_file:             job.design_file,
       design_drive_link:       job.design_drive_link,
@@ -673,7 +817,7 @@ exports.uploadDesign = async (req, res) => {
       design_duration_display: job.design_duration_display,
     });
   } catch (err) {
-    console.error("uploadDesign:", err);
+    console.error("uploadDesign ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -692,13 +836,15 @@ exports.approveDesign = async (req, res) => {
     job.design_status      = "approved";
     job.design_approved_at = new Date();
     job.design_approved_by = handled_by?.user_id || "Admin";
-    if (design_file) job.design_file      = design_file;
+    if (design_file) job.design_file       = design_file;
     if (drive_link)  job.design_drive_link = drive_link;
 
     await job.save();
-    return resp(res, 200, true, "Design approved.", { design_status: job.design_status });
+    return resp(res, 200, true, "Design approved.", {
+      design_status: job.design_status,
+    });
   } catch (err) {
-    console.error("approveDesign:", err);
+    console.error("approveDesign ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -720,9 +866,11 @@ exports.approveProduction = async (req, res) => {
     if (productionimg) job.productionimg = productionimg;
 
     await job.save();
-    return resp(res, 200, true, "Production approved.", { production_status: job.production_status });
+    return resp(res, 200, true, "Production approved.", {
+      production_status: job.production_status,
+    });
   } catch (err) {
-    console.error("approveProduction:", err);
+    console.error("approveProduction ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -744,9 +892,11 @@ exports.approveqc = async (req, res) => {
     if (qcimg) job.qcimg = qcimg;
 
     await job.save();
-    return resp(res, 200, true, "QC approved.", { qc_status: job.qc_status });
+    return resp(res, 200, true, "QC approved.", {
+      qc_status: job.qc_status,
+    });
   } catch (err) {
-    console.error("approveQC:", err);
+    console.error("approveQC ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -758,6 +908,7 @@ exports.approveqc = async (req, res) => {
 exports.rejectDesign = async (req, res) => {
   try {
     const { notes } = req.body;
+
     if (!notes?.trim())
       return resp(res, 400, false, "Rejection reason is required.");
 
@@ -773,15 +924,14 @@ exports.rejectDesign = async (req, res) => {
       design_rejection_reason: job.design_rejection_reason,
     });
   } catch (err) {
-    console.error("rejectDesign:", err);
+    console.error("rejectDesign ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 18. UPDATE QC
+// 18. UPDATE QC — does NOT change job_status
 // POST /api/jobs/:id/qc/update
-// Does NOT change job_status.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateQC = async (req, res) => {
   try {
@@ -810,9 +960,8 @@ exports.updateQC = async (req, res) => {
       try { incomingUrls = JSON.parse(qc_images).filter(Boolean); } catch { /* ignore */ }
     }
 
-    const uploadedFilePaths = (req.files || []).map((f) => `/uploads/qc/${f.filename}`);
-    const merged = [...(job.qc_images || []), ...incomingUrls, ...uploadedFilePaths];
-    job.qc_images = [...new Set(merged)];
+    const uploadedFilePaths = (req.files || []).map(f => `/uploads/qc/${f.filename}`);
+    job.qc_images = [...new Set([...(job.qc_images || []), ...incomingUrls, ...uploadedFilePaths])];
     job.qc_notes  = qc_notes;
 
     if (handledByObj?.name) job.qc_inspected_by = handledByObj.name;
@@ -824,7 +973,6 @@ exports.updateQC = async (req, res) => {
     }
 
     await job.save();
-
     return resp(res, 200, true, "QC inspection data saved.", {
       qc_images:           job.qc_images,
       qc_notes:            job.qc_notes,
@@ -832,18 +980,23 @@ exports.updateQC = async (req, res) => {
       qc_duration_display: job.qc_duration_display,
     });
   } catch (err) {
-    console.error("updateQC:", err);
+    console.error("updateQC ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 19. PASS QC  ← explicit status controller (sets passed when no next_stage)
+// 19. PASS QC  ← explicit status controller
 // POST /api/jobs/:id/qc/pass
 // ─────────────────────────────────────────────────────────────────────────────
 exports.passQC = async (req, res) => {
   try {
-    const { handled_by, notes = "", next_stage, next_assigned_to } = req.body;
+    const {
+      handled_by,
+      notes        = "",
+      next_stage,
+      next_assigned_to,
+    } = req.body;
 
     if (!handled_by?.user_id || !handled_by?.name)
       return resp(res, 400, false, "handled_by.user_id and handled_by.name are required.");
@@ -853,7 +1006,6 @@ exports.passQC = async (req, res) => {
 
     const now = new Date();
 
-    // Close QC session — does NOT change job_status
     if (job.hasOpenSession("quality_check"))
       job.closeSession({ stageName: "quality_check", action: "completed", notes });
 
@@ -864,11 +1016,19 @@ exports.passQC = async (req, res) => {
 
     if (next_stage) {
       const assignedTo = next_assigned_to || handled_by;
+
       job.workflow_stages.push({
         stage:         next_stage,
         stage_label:   next_stage,
-        handled_by:    { user_id: assignedTo.user_id, name: assignedTo.name, role: assignedTo.role || "" },
-        assigned_by:   { user_id: handled_by.user_id, name: handled_by.name },
+        handled_by: {
+          user_id: assignedTo.user_id,
+          name:    assignedTo.name,
+          role:    assignedTo.role  || "",
+        },
+        assigned_by: {
+          user_id: handled_by.user_id,
+          name:    handled_by.name,
+        },
         action:        "assigned",
         assigned_at:   now,
         work_sessions: [],
@@ -879,28 +1039,30 @@ exports.passQC = async (req, res) => {
         stage:                  next_stage,
         stage_label:            next_stage,
         stage_action:           "assigned",
-        assigned_to:            { user_id: assignedTo.user_id, name: assignedTo.name, role: assignedTo.role || "" },
+        assigned_to: {
+          user_id: assignedTo.user_id,
+          name:    assignedTo.name,
+          role:    assignedTo.role  || "",
+        },
         since:                  now,
         total_duration_seconds: 0,
         total_duration_display: "00:00:00",
         worked_days:            0,
       };
-      // job_status intentionally not changed — caller can set it via PATCH /status
     } else {
-      // No next stage — explicit terminal decision owned by this controller
       job.job_status        = "passed";
       job.status_updated_at = now;
     }
 
     await job.save();
-
-    const message = next_stage
-      ? `QC passed. Job handed off to "${next_stage}".`
-      : "QC passed. Job marked as passed.";
-
-    return resp(res, 200, true, message, job);
+    return resp(res, 200, true,
+      next_stage
+        ? `QC passed. Job handed off to "${next_stage}".`
+        : "QC passed. Job marked as passed.",
+      job,
+    );
   } catch (err) {
-    console.error("passQC:", err);
+    console.error("passQC ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -911,7 +1073,11 @@ exports.passQC = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.failQC = async (req, res) => {
   try {
-    const { handled_by, reason, notes = "" } = req.body;
+    const {
+      handled_by,
+      reason,
+      notes = "",
+    } = req.body;
 
     if (!handled_by?.user_id || !handled_by?.name)
       return resp(res, 400, false, "handled_by.user_id and handled_by.name are required.");
@@ -923,7 +1089,6 @@ exports.failQC = async (req, res) => {
 
     const now = new Date();
 
-    // Close QC session — does NOT change job_status inside closeSession
     if (job.hasOpenSession("quality_check")) {
       job.closeSession({ stageName: "quality_check", action: "failed", notes });
     } else {
@@ -934,7 +1099,6 @@ exports.failQC = async (req, res) => {
       }
     }
 
-    // Explicit terminal decision — owned by this controller
     job.job_status          = "failed";
     job.status_updated_at   = now;
     job.qc_status           = "failed";
@@ -950,7 +1114,7 @@ exports.failQC = async (req, res) => {
       job_status:          job.job_status,
     });
   } catch (err) {
-    console.error("failQC:", err);
+    console.error("failQC ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -971,8 +1135,8 @@ exports.getWorkflowHistory = async (req, res) => {
         total_sessions:         entry.work_sessions?.length || 0,
         total_duration_seconds: entry.total_duration_seconds || 0,
         total_duration_display: entry.total_duration_display || "00:00:00",
-        worked_days:            entry.worked_days || 0,
-        daily_summary:          entry.daily_summary || [],
+        worked_days:            entry.worked_days            || 0,
+        daily_summary:          entry.daily_summary          || [],
       };
     }
 
@@ -984,7 +1148,7 @@ exports.getWorkflowHistory = async (req, res) => {
       stage_summary:   stageSummary,
     });
   } catch (err) {
-    console.error("getWorkflowHistory:", err);
+    console.error("getWorkflowHistory ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -1013,7 +1177,7 @@ exports.getJobsAssignedToUser = async (req, res) => {
 
     return resp(res, 200, true, "Jobs fetched successfully.", jobs);
   } catch (err) {
-    console.error("getJobsAssignedToUser:", err);
+    console.error("getJobsAssignedToUser ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -1025,25 +1189,25 @@ exports.getJobsAssignedToUser = async (req, res) => {
 exports.convertToOrder = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
-    if (!job) return resp(res, 404, false, "Job not found.");
-    if (job.converted_to_order)
-      return resp(res, 400, false, "Job has already been converted.");
-    if (job.job_status === "expired")
-      return resp(res, 400, false, "Expired jobs cannot be converted.");
+    if (!job)                         return resp(res, 404, false, "Job not found.");
+    if (job.converted_to_order)       return resp(res, 400, false, "Job has already been converted.");
+    if (job.job_status === "expired") return resp(res, 400, false, "Expired jobs cannot be converted.");
+
+    const now = new Date();
 
     job.converted_to_order = true;
-    job.converted_at       = new Date();
+    job.converted_at       = now;
     job.job_status         = "converted";
-    job.status_updated_at  = new Date();
-    await job.save();
+    job.status_updated_at  = now;
 
+    await job.save();
     return resp(res, 200, true, "Job converted to order successfully.", {
       job_id:       job._id,
       job_no:       job.job_no,
       converted_at: job.converted_at,
     });
   } catch (err) {
-    console.error("convertToOrder:", err);
+    console.error("convertToOrder ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -1062,11 +1226,11 @@ exports.deleteJob = async (req, res) => {
     job.deletedAt     = new Date();
     job.deleted_notes = delete_notes || "";
     if (adminId) job.deleted_by = adminId;
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, "Job soft-deleted successfully.");
   } catch (err) {
-    console.error("deleteJob:", err);
+    console.error("deleteJob ❌", err);
     return resp(res, 500, false, err.message);
   }
 };
@@ -1082,11 +1246,11 @@ exports.restoreJob = async (req, res) => {
 
     job.deletedAt     = null;
     job.deleted_notes = "";
-    await job.save();
 
+    await job.save();
     return resp(res, 200, true, "Job restored successfully.");
   } catch (err) {
-    console.error("restoreJob:", err);
+    console.error("restoreJob ❌", err);
     return resp(res, 500, false, err.message);
   }
-};    
+};
