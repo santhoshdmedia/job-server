@@ -208,21 +208,15 @@ exports.issueMaterial = async (req, res) => {
     if (!issued_qty || issued_qty <= 0)
       return resp(res, 400, false, "issued_qty must be greater than 0.");
 
-    // FIX: issued_by validation — check both user_id AND name correctly
     if (!issued_by?.user_id || !issued_by?.name)
       return resp(res, 400, false, "issued_by.user_id and issued_by.name are required.");
 
-    // FIX: issued_to validation — MUST check isOutsourced BEFORE validating
-    // issued_to.user_id, because outsourced jobs legitimately have no user_id
     if (isOutsourced) {
-      // For outsourced work we need a vendor name (stored in outsource_vendor)
       if (!outsource_vendor?.trim())
         return resp(res, 400, false, "outsource_vendor is required for outsourced work.");
-      // issued_to.name should also be the vendor name — accept either
       if (!issued_to?.name && !outsource_vendor?.trim())
         return resp(res, 400, false, "issued_to.name or outsource_vendor is required for outsourced work.");
     } else {
-      // In-house: a real employee must be selected
       if (!issued_to?.user_id || !issued_to?.name)
         return resp(res, 400, false, "issued_to.user_id and issued_to.name are required.");
     }
@@ -245,7 +239,6 @@ exports.issueMaterial = async (req, res) => {
           "sq_ft must be greater than 0 when calc_mode is 'sqft'."
         );
     } else {
-      // In server/manual mode dimensions are required
       if (!dimensions?.width || !dimensions?.height)
         return resp(res, 400, false,
           "dimensions.width and dimensions.height are required when calc_mode is 'server'."
@@ -324,6 +317,8 @@ exports.issueMaterial = async (req, res) => {
       ? (outsource_vendor.trim() || issued_to?.name || "")
       : (issued_to?.name || "");
 
+    const resolvedOutsourceVendor = isOutsourced ? outsource_vendor.trim() : "";
+
     // ── Create issue record ──────────────────────────────────────────────────
     const issue = await MaterialIssue.create({
       issue_no,
@@ -364,8 +359,30 @@ exports.issueMaterial = async (req, res) => {
       },
       issue_notes,
       outsource_type,
-      outsource_vendor: isOutsourced ? outsource_vendor.trim() : "",
+      outsource_vendor: resolvedOutsourceVendor,
       status: "issued",
+    });
+
+    // ── FIX: Write outsource info back into the Job's cart_items array ───────
+    // This ensures the Job document also reflects outsource_vendor and
+    // outsource_type so it's visible when querying the Job directly.
+    await Job.findByIdAndUpdate(jobId, {
+      $set: {
+        [`cart_items.${cart_item_index}.outsource_type`]:   outsource_type,
+        [`cart_items.${cart_item_index}.outsource_vendor`]: resolvedOutsourceVendor,
+        [`cart_items.${cart_item_index}.material_issue_id`]: issue._id,
+        [`cart_items.${cart_item_index}.issued_qty`]:        issued_qty,
+        [`cart_items.${cart_item_index}.issued_by`]: {
+          user_id: issued_by.user_id,
+          name:    issued_by.name,
+          role:    issued_by.role || "",
+        },
+        [`cart_items.${cart_item_index}.issued_to`]: {
+          user_id: isOutsourced ? null : issued_to.user_id,
+          name:    resolvedIssuedToName,
+          role:    isOutsourced ? "outsource" : (issued_to.role || ""),
+        },
+      },
     });
 
     // ── Decrement stock ──────────────────────────────────────────────────────
@@ -385,7 +402,7 @@ exports.issueMaterial = async (req, res) => {
       suggested_qty:    calc.required_sqft,
       issued_to:        resolvedIssuedToName,
       outsource_type,
-      outsource_vendor: isOutsourced ? outsource_vendor.trim() : "",
+      outsource_vendor: resolvedOutsourceVendor,
       calculation:      calc,
       stock_remaining:  parseFloat((available - issued_qty).toFixed(4)),
     });
@@ -1039,6 +1056,18 @@ exports.deleteMaterialIssue = async (req, res) => {
       "System",
       `Reversal — deleted issue ${issue.issue_no}`
     );
+
+    // ── FIX: Clear outsource fields from Job cart_item on delete ─────────────
+    await Job.findByIdAndUpdate(issue.job_id, {
+      $unset: {
+        [`cart_items.${issue.cart_item_index}.outsource_type`]:    "",
+        [`cart_items.${issue.cart_item_index}.outsource_vendor`]:  "",
+        [`cart_items.${issue.cart_item_index}.material_issue_id`]: "",
+        [`cart_items.${issue.cart_item_index}.issued_qty`]:        "",
+        [`cart_items.${issue.cart_item_index}.issued_by`]:         "",
+        [`cart_items.${issue.cart_item_index}.issued_to`]:         "",
+      },
+    });
 
     issue.is_deleted = true;
     await issue.save();

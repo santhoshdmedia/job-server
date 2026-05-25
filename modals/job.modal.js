@@ -145,6 +145,32 @@ const jobCartItemSchema = new Schema(
 
     design_file: { type: String, default: "" },
     notes:       { type: String, default: "" },
+
+    // ── FIX: Material Issue fields ─────────────────────────────────────────
+    // These were missing — Mongoose strict mode was silently dropping them.
+    outsource_type:   { type: String, default: "none" },
+    outsource_vendor: { type: String, default: "" },
+
+    material_issue_id: {
+      type: Schema.Types.ObjectId,
+      ref:  "MaterialIssue",
+      default: null,
+    },
+
+    issued_qty: { type: Number, default: 0 },
+
+    issued_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+
+    issued_to: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+    // ───────────────────────────────────────────────────────────────────────
   },
   { _id: false },
 );
