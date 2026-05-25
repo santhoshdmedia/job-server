@@ -179,11 +179,11 @@ const materialIssueSchema = new Schema(
     suggested_qty: { type: Number, default: 0 },
     issued_at:     { type: Date, default: Date.now },
 
-    issued_to: {
-      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", required: true },
-      name:    { type: String, default: "" },
-      role:    { type: String, default: "" },
-    },
+  issued_to: {
+    user_id: { type: Schema.Types.ObjectId, ref: "admin_users", required: false, default: null },
+    name:    { type: String, default: "" },
+    role:    { type: String, default: "" },
+  },
     issued_by: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", required: true },
       name:    { type: String, default: "" },
@@ -198,6 +198,25 @@ const materialIssueSchema = new Schema(
 
     // ── Issue notes ───────────────────────────────────────────────────────────
     issue_notes: { type: String, default: "" },
+
+    // ── Outsource ─────────────────────────────────────────────────────────────
+    // Tracks whether this material issue is for in-house or outsourced work.
+    outsource_type: {
+      type:    String,
+      enum:    [
+        "none",
+        "printing",
+        "lamination",
+        "fabrication",
+        "installation",
+        "cutting",
+        "full_job",
+        "other",
+      ],
+      default: "none",
+      index:   true,
+    },
+    outsource_vendor: { type: String, default: "" }, // e.g. "Sri Murugan Printers, Chennai"
 
     // ── Production metadata (filled when production is completed) ─────────────
     machine_name: { type: String, default: "" },          // e.g. "HP Latex 360"
@@ -238,6 +257,7 @@ materialIssueSchema.index({ "issued_to.user_id": 1, createdAt: -1 });
 materialIssueSchema.index({ "material.product_id": 1 });
 materialIssueSchema.index({ status: 1, createdAt: -1 });
 materialIssueSchema.index({ "return.is_flagged": 1 });
+materialIssueSchema.index({ outsource_type: 1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static: Auto-generate issue number  MI0001, MI0002 …
