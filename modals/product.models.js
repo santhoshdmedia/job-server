@@ -1,29 +1,37 @@
-// ==================== PRODUCT MODEL (UPDATED — Unit-Aware Quantities) ====================
-// Adds per-unit quantity tracking to stock entries and material issuances.
-// Products can now store stock in different unit types (sqft, feet, meters, pcs, kg, rolls).
-// All existing fields are preserved unchanged.
+// ==================== PRODUCT MODEL ====================
+// Fields added / updated:
+//   • material_brand  {String}  — Brand / manufacturer name (e.g. "3M", "LG Hausys")
+//   • size            {Object}  — Physical dimensions: { width, height, unit }
+// All other fields are preserved unchanged.
 
 const { default: mongoose } = require("mongoose");
 
-// ─── Supported units ─────────────────────────────────────────────────────────
-// sqft  = square feet  (area material, e.g. vinyl, banner)
-// sqm   = square meters (area material, metric)
-// feet  = linear feet  (roll material measured by length)
-// meters= linear meters
-// pcs   = individual pieces / units
-// kg    = weight
-// rolls = full rolls of material
-
+// ─── Supported stock-tracking units ──────────────────────────────────────────
 const UNIT_ENUM = ["sqft", "sqm", "feet", "meters", "pcs", "kg", "rolls"];
 
-// ─── Sub-schema: unit-quantity pair ──────────────────────────────────────────
-// Stored inside each stock_info entry and material_issue log so every
-// transaction records BOTH the raw count AND the unit dimension.
-// Example: add_stock: 3 rolls, each roll is 50 sqft → qty: 150, unit: "sqft"
+// ─── Supported size-dimension units ──────────────────────────────────────────
+// Kept separate from UNIT_ENUM so physical dimensions are never confused
+// with stock-tracking units.
+const SIZE_UNIT_ENUM = ["inches", "feet", "cm", "meters", "mm"];
+
+// ─── Sub-schema: unit-quantity pair (stock tracking) ─────────────────────────
 const unitQtySchema = new mongoose.Schema(
   {
-    qty:  { type: Number, default: 0 },      // absolute quantity in `unit`
+    qty:  { type: Number, default: 0 },
     unit: { type: String, enum: UNIT_ENUM, default: "pcs" },
+  },
+  { _id: false }
+);
+
+// ─── Sub-schema: physical size of the product ────────────────────────────────
+// Stores Width × Height with a shared measurement unit.
+// Both width and height are nullable so partial sizes are supported
+// (e.g. width-only roll of vinyl).
+const sizeSchema = new mongoose.Schema(
+  {
+    width:  { type: Number, default: null },  // e.g. 4.0  (feet)
+    height: { type: Number, default: null },  // e.g. 8.0  (feet)
+    unit:   { type: String, enum: SIZE_UNIT_ENUM, default: "feet" },
   },
   { _id: false }
 );
@@ -32,8 +40,7 @@ const unitQtySchema = new mongoose.Schema(
 const stockInfoSchema = new mongoose.Schema(
   {
     date:         { type: Date,   default: Date.now },
-    add_stock:    { type: Number },          // legacy: raw piece/roll count
-    // NEW: unit-aware quantity
+    add_stock:    { type: Number },
     unit_qty:     { type: unitQtySchema, default: () => ({ qty: 0, unit: "pcs" }) },
     buy_price:    { type: String },
     invoice:      { type: String },
@@ -49,8 +56,7 @@ const stockInfoSchema = new mongoose.Schema(
 const stockOfflineSchema = new mongoose.Schema(
   {
     date:             { type: Date,   default: Date.now },
-    stock:            { type: Number },      // legacy: raw count
-    // NEW: unit-aware quantity
+    stock:            { type: Number },
     unit_qty:         { type: unitQtySchema, default: () => ({ qty: 0, unit: "pcs" }) },
     customer_details: { type: String },
     handler_name:     { type: String },
@@ -63,162 +69,177 @@ const stockOfflineSchema = new mongoose.Schema(
 // ─── Sub-schema: material issuance log entry ──────────────────────────────────
 const materialIssueLogSchema = new mongoose.Schema(
   {
-    issue_id:     { type: mongoose.Schema.Types.ObjectId, ref: "material_issue" },
-    issue_no:     { type: String },
-    job_no:       { type: String },
-    issued_qty:   { type: Number },
-    // NEW: unit-aware issued quantity (replaces bare `unit` string)
-    unit_qty:     { type: unitQtySchema, default: () => ({ qty: 0, unit: "sqft" }) },
-    issued_to:    { type: String },
-    issued_by:    { type: String },
-    issued_at:    { type: Date, default: Date.now },
-    returned_qty: { type: Number, default: null },
-    // NEW: unit-aware return quantity
+    issue_id:        { type: mongoose.Schema.Types.ObjectId, ref: "material_issue" },
+    issue_no:        { type: String },
+    job_no:          { type: String },
+    issued_qty:      { type: Number },
+    unit_qty:        { type: unitQtySchema, default: () => ({ qty: 0, unit: "sqft" }) },
+    issued_to:       { type: String },
+    issued_by:       { type: String },
+    issued_at:       { type: Date, default: Date.now },
+    returned_qty:    { type: Number, default: null },
     return_unit_qty: { type: unitQtySchema, default: null },
-    unit:         { type: String, enum: UNIT_ENUM, default: "sqft" }, // kept for legacy reads
-    notes:        { type: String, default: "" },
+    unit:            { type: String, enum: UNIT_ENUM, default: "sqft" },
+    notes:           { type: String, default: "" },
   },
   { _id: false }
 );
 
 // ─── Sub-schema: per-unit stock summary ───────────────────────────────────────
-// Tracks the net stock broken down by each unit type independently.
-// e.g. a vinyl product may simultaneously track sqft AND rolls.
 const unitStockSummarySchema = new mongoose.Schema(
   {
-    unit:         { type: String, enum: UNIT_ENUM },
-    total_in:     { type: Number, default: 0 },
-    total_out:    { type: Number, default: 0 },
-    net_stock:    { type: Number, default: 0 },
+    unit:      { type: String, enum: UNIT_ENUM },
+    total_in:  { type: Number, default: 0 },
+    total_out: { type: Number, default: 0 },
+    net_stock: { type: Number, default: 0 },
   },
   { _id: false }
 );
 
-// ─── Main schema ──────────────────────────────────────────────────────────────
+// ─── Main Product Schema ──────────────────────────────────────────────────────
 
-module.exports = mongoose.model(
-  "product",
-  new mongoose.Schema(
-    {
-      // ── Identity (unchanged) ────────────────────────────────────────────────
-      name:             { type: String, required: true },
-      type:             { type: String, enum: ["Stand Alone Product", "Variable Product", "Variant Product"] },
-      HSNcode_time:     { type: String },
-      product_code:     { type: String },
-      product_codeS_NO: { type: String },
-
-      // ── Stock (updated) ─────────────────────────────────────────────────────
-      stock_count:   { type: Number },            // legacy: piece count (kept for compatibility)
-      stocks_status: { type: String },
-      stock_info:    [stockInfoSchema],
-      stock_offline: [stockOfflineSchema],
-
-      // ── NEW: Primary unit for this product ──────────────────────────────────
-      // Determines which unit is shown by default in stock modals and the table.
-      primary_unit:  { type: String, enum: UNIT_ENUM, default: "pcs" },
-
-      // ── NEW: Additional units this product supports ───────────────────────
-      // Allows a product to be tracked in multiple unit dimensions simultaneously.
-      // e.g. vinyl roll = ["rolls", "sqft"]; lumber = ["feet", "pcs"]
-      supported_units: {
-        type: [{ type: String, enum: UNIT_ENUM }],
-        default: ["pcs"],
-      },
-
-      // ── NEW: Per-unit stock summary (auto-updated on stock in/out) ──────────
-      unit_stock_summary: {
-        type:    [unitStockSummarySchema],
-        default: [],
-      },
-
-      // ── Images (unchanged) ──────────────────────────────────────────────────
-      images: { type: Array },
-
-      // ── Material issuance log ────────────────────────────────────────────────
-      material_issues: {
-        type:    [materialIssueLogSchema],
-        default: [],
-      },
-
-      // ── Derived material stats (updated on every issue/return) ───────────────
-      material_stats: {
-        total_issued_qty:   { type: Number, default: 0 },
-        total_returned_qty: { type: Number, default: 0 },
-        total_wastage_qty:  { type: Number, default: 0 },
-        avg_wastage_pct:    { type: Number, default: 0 },
-        issue_count:        { type: Number, default: 0 },
-        // NEW: unit used for material_stats totals
-        stats_unit:         { type: String, enum: UNIT_ENUM, default: "sqft" },
-        _last_updated:      { type: Date,   default: null },
-      },
+const productSchema = new mongoose.Schema(
+  {
+    // ── Identity ──────────────────────────────────────────────────────────────
+    name:             { type: String, required: true },
+    type:             {
+      type: String,
+      enum: ["Stand Alone Product", "Variable Product", "Variant Product"],
     },
-    {
-      collection: "product",
-      timestamps: true,
-    }
-  )
+    HSNcode_time:     { type: String },
+    product_code:     { type: String },
+    product_codeS_NO: { type: String },
+    Vendor_Code:      { type: String },
+    seo_url:          { type: String },
+
+    // ── NEW: Material Brand ───────────────────────────────────────────────────
+    // Free-text brand / manufacturer name of the raw material.
+    // Stored at the product level — not per-variant.
+    // Optional; defaults to "" so existing documents are unaffected.
+    material_brand: {
+      type:    String,
+      default: "",
+      trim:    true,
+    },
+
+    // ── NEW: Physical Size ────────────────────────────────────────────────────
+    // Width × Height with a shared measurement unit.
+    // The sub-schema uses SIZE_UNIT_ENUM (inches / feet / cm / meters / mm)
+    // which is intentionally separate from the stock-tracking UNIT_ENUM.
+    // null means "no size specified" — this is the default for old documents.
+    size: {
+      type:    sizeSchema,
+      default: null,
+    },
+
+    // ── Pricing ───────────────────────────────────────────────────────────────
+    MRP_price:              { type: String },
+    customer_product_price: { type: String },
+    Deler_product_price:    { type: String },
+    corporate_product_price:{ type: String },
+
+    // ── Stock ─────────────────────────────────────────────────────────────────
+    stock_count:   { type: Number },
+    stocks_status: { type: String },
+    stock_info:    [stockInfoSchema],
+    stock_offline: [stockOfflineSchema],
+
+    // ── Unit configuration ────────────────────────────────────────────────────
+    primary_unit: {
+      type:    String,
+      enum:    UNIT_ENUM,
+      default: "pcs",
+    },
+    supported_units: {
+      type:    [{ type: String, enum: UNIT_ENUM }],
+      default: ["pcs"],
+    },
+    unit_stock_summary: {
+      type:    [unitStockSummarySchema],
+      default: [],
+    },
+
+    // ── Images ────────────────────────────────────────────────────────────────
+    images: { type: Array },
+
+    // ── Visibility ────────────────────────────────────────────────────────────
+    is_visible: { type: Boolean, default: false },
+    is_cloned:  { type: Boolean, default: false },
+    parent_product_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref:  "product",
+      default: null,
+    },
+
+    // ── Category & Vendor references ──────────────────────────────────────────
+    category_details:     { type: mongoose.Schema.Types.ObjectId, ref: "main_category" },
+    sub_category_details: { type: mongoose.Schema.Types.ObjectId, ref: "sub_category" },
+    vendor_details:       { type: mongoose.Schema.Types.ObjectId, ref: "vendor" },
+
+    // ── Variants ──────────────────────────────────────────────────────────────
+    variants:       { type: Array, default: [] },
+    variants_price: { type: Array, default: [] },
+
+    // ── Material issuance log ─────────────────────────────────────────────────
+    material_issues: {
+      type:    [materialIssueLogSchema],
+      default: [],
+    },
+
+    // ── Derived material stats ────────────────────────────────────────────────
+    material_stats: {
+      total_issued_qty:   { type: Number, default: 0 },
+      total_returned_qty: { type: Number, default: 0 },
+      total_wastage_qty:  { type: Number, default: 0 },
+      avg_wastage_pct:    { type: Number, default: 0 },
+      issue_count:        { type: Number, default: 0 },
+      stats_unit:         { type: String, enum: UNIT_ENUM, default: "sqft" },
+      _last_updated:      { type: Date,   default: null },
+    },
+  },
+  {
+    collection: "product",
+    timestamps: true,   // adds createdAt & updatedAt automatically
+  }
 );
+
+// ─── Optional indexes for common queries ──────────────────────────────────────
+// Uncomment whichever you use frequently.
+
+// productSchema.index({ material_brand: 1 });          // filter by brand
+// productSchema.index({ "size.unit": 1 });             // filter by size unit
+// productSchema.index({ primary_unit: 1 });            // filter by unit
+// productSchema.index({ name: "text" });               // full-text on name
+
+module.exports = mongoose.model("product", productSchema);
 
 /*
 =============================================================================
-UNIT DESIGN NOTES
+NEW FIELD NOTES
 =============================================================================
 
-PRIMARY UNIT
-  The `primary_unit` field sets which unit is displayed by default in the UI.
-  Every stock-in and stock-out entry records a `unit_qty` sub-document so
-  historical entries are always interpretable regardless of future unit changes.
+MATERIAL BRAND  (material_brand: String)
+  ● Free-text; trim whitespace automatically.
+  ● Stored at the product level, not per-variant.
+  ● Examples:  "3M"  |  "LG Hausys"  |  "Avery Dennison"  |  ""
+  ● Existing documents get default "" — no migration needed.
 
-SUPPORTED UNITS
-  A product may be received in rolls and consumed in sqft.
-  Set supported_units: ["rolls", "sqft"] and record:
-    - stock_info entries with unit_qty: { qty: 3, unit: "rolls" }
-    - stock_offline entries with unit_qty: { qty: 150, unit: "sqft" }
-  The UI will display both summaries side by side.
+SIZE  (size: { width, height, unit })
+  ● Both width and height are nullable so partial sizes work fine.
+      { width: 54, height: null, unit: "inches" }  ← roll width only
+      { width: 4,  height: 8,   unit: "feet"   }  ← full sheet
+  ● size: null means "not specified" (default for all existing documents).
+  ● SIZE_UNIT_ENUM:  "inches" | "feet" | "cm" | "meters" | "mm"
+    (separate from UNIT_ENUM which is used for stock-quantity units)
 
-UNIT STOCK SUMMARY
-  unit_stock_summary is a denormalised view rebuilt on every stock mutation:
-  [
-    { unit: "rolls", total_in: 3, total_out: 0, net_stock: 3 },
-    { unit: "sqft",  total_in: 0, total_out: 150, net_stock: -150 }
-  ]
-  Run this aggregation to rebuild it for existing documents:
-
-  db.material_issue.aggregate([
-    { $group: {
-        _id:               "$material.product_id",
-        total_issued:      { $sum: "$issued_qty" },
-        total_returned:    { $sum: "$return.returned_qty" },
-        total_wastage:     { $sum: "$return.actual_wastage_qty" },
-        avg_wastage_ratio: { $avg: "$return.wastage_ratio_pct" },
-        issue_count:       { $sum: 1 },
-    }},
-    { $merge: { into: "product",
-        on: "_id",
-        whenMatched: [{ $set: {
-          "material_stats.total_issued_qty":   "$$new.total_issued",
-          "material_stats.total_returned_qty": "$$new.total_returned",
-          "material_stats.total_wastage_qty":  "$$new.total_wastage",
-          "material_stats.avg_wastage_pct":    "$$new.avg_wastage_ratio",
-          "material_stats.issue_count":        "$$new.issue_count",
-        }}],
-    }},
-  ]);
-
-MIGRATION
-  Existing documents without primary_unit / supported_units / unit_stock_summary
-  will receive defaults ("pcs" / ["pcs"] / []) automatically — no migration needed.
-  Existing stock_info and stock_offline entries without unit_qty will default to
-  { qty: 0, unit: "pcs" }. You may want to backfill these using:
-
+MIGRATION (if you want explicit defaults in old documents)
   db.product.updateMany(
-    { "stock_info.unit_qty": { $exists: false } },
-    { $set: { "stock_info.$[].unit_qty": { qty: 0, unit: "pcs" } } }
+    { material_brand: { $exists: false } },
+    { $set: { material_brand: "" } }
   );
   db.product.updateMany(
-    { "stock_offline.unit_qty": { $exists: false } },
-    { $set: { "stock_offline.$[].unit_qty": { qty: 0, unit: "pcs" } } }
+    { size: { $exists: false } },
+    { $set: { size: null } }
   );
-
 =============================================================================
 */

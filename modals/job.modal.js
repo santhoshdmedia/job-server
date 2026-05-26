@@ -448,3 +448,4 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
 // Clear cache so updated schema is always used after changes
 delete mongoose.models.job;
 module.exports = mongoose.model("job", jobSchema);
+
