@@ -15,17 +15,29 @@ const { ObjectId } = mongoose.Types;
 const _ = require("lodash");
 
 // ─── Helper: Normalise size ───────────────────────────────────────────────────
+// ✅ FIX: Accepts { width, width_unit, height, height_unit } from frontend.
+//         Drops the object entirely if both dimensions are empty/null.
 const normaliseSize = (size) => {
   if (!size) return null;
+
   const { width, height } = size;
   const hasAnyDimension =
     (width  !== null && width  !== undefined && width  !== "") ||
     (height !== null && height !== undefined && height !== "");
-  return hasAnyDimension ? size : null;
+
+  if (!hasAnyDimension) return null;
+
+  return {
+    width:       width  !== "" && width  !== undefined ? Number(width)  : null,
+    width_unit:  size.width_unit  || "feet",
+    height:      height !== "" && height !== undefined ? Number(height) : null,
+    height_unit: size.height_unit || "feet",
+    // legacy field — set to width_unit so old reads don't break
+    unit:        size.width_unit  || "feet",
+  };
 };
 
 // ─── Add Product ──────────────────────────────────────────────────────────────
-// Frontend sends a fully-formed stock_info array — just normalise size and save.
 const addProduct = async (req, res) => {
   try {
     req.body.size = normaliseSize(req.body.size);
@@ -81,8 +93,13 @@ const getProduct = async (req, res) => {
       where.material_brand = { $regex: material_brand, $options: "i" };
     }
 
+    // ✅ FIX: match against width_unit OR legacy unit field
     if (size_unit) {
-      where["size.unit"] = size_unit;
+      where.$or = [
+        { "size.width_unit":  size_unit },
+        { "size.height_unit": size_unit },
+        { "size.unit":        size_unit },
+      ];
     }
 
     if (id) {

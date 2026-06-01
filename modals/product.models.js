@@ -1,6 +1,6 @@
 const { default: mongoose } = require("mongoose");
 
-const UNIT_ENUM = ["sqft", "sqm", "feet", "meters", "pcs", "kg", "rolls"];
+const UNIT_ENUM      = ["sqft", "sqm", "feet", "meters", "pcs", "kg", "rolls"];
 const SIZE_UNIT_ENUM = ["inches", "feet", "cm", "meters", "mm"];
 
 const unitQtySchema = new mongoose.Schema(
@@ -11,16 +11,20 @@ const unitQtySchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ✅ FIX: width and height now each have their own unit field
 const sizeSchema = new mongoose.Schema(
   {
-    width:  { type: Number, default: null },
-    height: { type: Number, default: null },
-    unit:   { type: String, enum: SIZE_UNIT_ENUM, default: "feet" },
+    width:       { type: Number, default: null },
+    width_unit:  { type: String, enum: SIZE_UNIT_ENUM, default: "feet" },
+    height:      { type: Number, default: null },
+    height_unit: { type: String, enum: SIZE_UNIT_ENUM, default: "feet" },
+    // Kept for backward-compat reads; will no longer be written for new docs
+    unit:        { type: String, enum: SIZE_UNIT_ENUM, default: "feet" },
   },
   { _id: false }
 );
 
-// ✅ FIX 1: Added invoice_date field (was being silently stripped before)
+// ✅ invoice_date field present so it is never silently stripped
 const stockInfoSchema = new mongoose.Schema(
   {
     date:         { type: Date,   default: Date.now },
@@ -82,10 +86,10 @@ const productSchema = new mongoose.Schema(
   {
     name:             { type: String, required: true },
 
-    // ✅ FIX 2: Removed strict enum on `type` — was causing 500 ValidationError
-    // when frontend sent any value not exactly matching the enum list.
+    // No strict enum — frontend may send any string value
     type:             { type: String },
 
+    // HSN code field kept in DB (existing data), just not shown in UI anymore
     HSNcode_time:     { type: String },
     product_code:     { type: String },
     product_codeS_NO: { type: String },
