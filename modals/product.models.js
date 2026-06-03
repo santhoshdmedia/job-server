@@ -11,7 +11,7 @@ const unitQtySchema = new mongoose.Schema(
   { _id: false }
 );
 
-// ✅ FIX: width and height now each have their own unit field
+// width and height each have their own unit field
 const sizeSchema = new mongoose.Schema(
   {
     width:       { type: Number, default: null },
@@ -24,7 +24,7 @@ const sizeSchema = new mongoose.Schema(
   { _id: false }
 );
 
-// ✅ invoice_date field present so it is never silently stripped
+// invoice_date field present so it is never silently stripped
 const stockInfoSchema = new mongoose.Schema(
   {
     date:         { type: Date,   default: Date.now },
@@ -106,6 +106,24 @@ const productSchema = new mongoose.Schema(
       type:    sizeSchema,
       default: null,
     },
+
+    // ─── NEW: Area & quantity fields ──────────────────────────────────────────
+    // calculated_area: area of ONE unit (e.g. 10.5 sqft), derived from size
+    calculated_area: {
+      type:    Number,
+      default: null,
+    },
+    // product_quantity: how many separate product records were created in one batch
+    product_quantity: {
+      type:    Number,
+      default: 1,
+    },
+    // product_codes: all auto-generated codes for this batch (stored on every record)
+    product_codes: {
+      type:    [String],
+      default: [],
+    },
+    // ─────────────────────────────────────────────────────────────────────────
 
     MRP_price:               { type: String },
     customer_product_price:  { type: String },
