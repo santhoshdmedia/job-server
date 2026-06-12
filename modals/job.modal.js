@@ -104,6 +104,58 @@ workflowStageSchema.methods.recomputeTotals = function () {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-Schema: Per-Item Design File
+// Each cart item has an array of these — one per uploaded file.
+// label  : e.g. "Cutting File", "Printing File", "Mockup", "Reference", etc.
+// caption: free-text note the designer can add.
+// ─────────────────────────────────────────────────────────────────────────────
+const itemDesignFileSchema = new Schema(
+  {
+    url:       { type: String, required: true },
+    file_name: { type: String, default: "" },
+    file_type: { type: String, default: "" }, // JPEG | PNG | PDF | CDR | DXF …
+    label:     {
+      type: String,
+      enum: ["Cutting File", "Printing File", "Mockup", "Reference", "Final Artwork", "Other"],
+      default: "Other",
+    },
+    caption:     { type: String, default: "" },
+    uploaded_at: { type: Date, default: () => new Date() },
+    uploaded_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+    },
+  },
+  { _id: true, timestamps: false },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-Schema: Per-Item Designer Assignment
+// A single cart item can be assigned to multiple designers.
+// This tracks who is responsible for which item, their individual upload
+// status, and approval state.
+// ─────────────────────────────────────────────────────────────────────────────
+const itemDesignerAssignmentSchema = new Schema(
+  {
+    user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+    name:    { type: String, default: "" },
+    role:    { type: String, default: "" },
+
+    assigned_at:  { type: Date, default: () => new Date() },
+    assigned_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+    },
+
+    // "assigned" | "in_progress" | "uploaded" | "approved" | "rejected"
+    status:           { type: String, default: "assigned" },
+    status_updated_at: { type: Date, default: null },
+    notes:            { type: String, default: "" },
+  },
+  { _id: true, timestamps: false },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Supporting Sub-Schemas
 // ─────────────────────────────────────────────────────────────────────────────
 const addressSchema = new Schema(
@@ -122,6 +174,9 @@ const addressSchema = new Schema(
 // ─────────────────────────────────────────────────────────────────────────────
 const jobCartItemSchema = new Schema(
   {
+    // ── A stable client-side key so the frontend can always reference the item
+    item_id: { type: String, default: "" },
+
     product_id:    { type: String,  default: "" },
     product_name:  { type: String },
     printing_type: { type: String },
@@ -143,11 +198,12 @@ const jobCartItemSchema = new Schema(
     line_base:      { type: Number, default: 0 },
     line_total:     { type: Number, default: 0 },
 
+    // ── Legacy single design file (kept for backward compat) ──────────────
     design_file: { type: String, default: "" },
-    notes:       { type: String, default: "" },
 
-    // ── FIX: Material Issue fields ─────────────────────────────────────────
-    // These were missing — Mongoose strict mode was silently dropping them.
+    notes: { type: String, default: "" },
+
+    // ── Material Issue fields ─────────────────────────────────────────────
     outsource_type:   { type: String, default: "none" },
     outsource_vendor: { type: String, default: "" },
 
@@ -170,9 +226,24 @@ const jobCartItemSchema = new Schema(
       name:    { type: String, default: "" },
       role:    { type: String, default: "" },
     },
-    // ───────────────────────────────────────────────────────────────────────
+
+    // ── NEW: Per-item design files (array, each with label + caption) ─────
+    design_files: { type: [itemDesignFileSchema], default: [] },
+
+    // ── NEW: Per-item design workflow status ──────────────────────────────
+    // "pending" | "uploaded" | "approved" | "rejected"
+    design_status: { type: String, default: "pending" },
+    design_rejection_reason: { type: String, default: "" },
+    design_approved_at: { type: Date, default: null },
+    design_approved_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+    },
+
+    // ── NEW: Per-item designer assignments (supports multiple designers) ──
+    designers: { type: [itemDesignerAssignmentSchema], default: [] },
   },
-  { _id: false },
+  { _id: true },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +257,6 @@ const jobSchema = new Schema(
     // ── Customer Info ──────────────────────────────────────────────────────
     customer_name:  { type: String, default: "" },
     customer_phone: { type: String, default: "" },
-    // ✅ company_name is stored here — controller must always set it explicitly
     company_name:   { type: String, default: "" },
 
     cart_items:              { type: [jobCartItemSchema] },
@@ -216,13 +286,14 @@ const jobSchema = new Schema(
     // ── Full stage pipeline ────────────────────────────────────────────────
     workflow_stages: { type: [workflowStageSchema], default: [] },
 
-    // ── Design file ───────────────────────────────────────────────────────
+    // ── Job-level design fields (legacy + summary) ────────────────────────
     design_file:             { type: String,  default: "" },
     design_drive_link:       { type: String,  default: "" },
     design_uploaded_at:      { type: Date },
     design_uploaded_by:      { type: String,  default: "" },
     design_duration_seconds: { type: Number,  default: 0 },
     design_duration_display: { type: String,  default: "00:00:00" },
+    // "pending" | "partial" | "uploaded" | "approved" | "rejected"
     design_status:           { type: String,  default: "pending" },
     design_rejection_reason: { type: String,  default: "" },
     design_approved_at:      { type: Date },
@@ -297,6 +368,16 @@ jobSchema.pre("save", function () {
   }
 });
 
+// Auto-generate item_id for any cart item that lacks one
+jobSchema.pre("save", function () {
+  for (const item of this.cart_items || []) {
+    if (!item.item_id) {
+      item.item_id = new mongoose.Types.ObjectId().toHexString();
+    }
+  }
+});
+
+// Recompute workflow totals + sync current_stage snapshot
 jobSchema.pre("save", function () {
   if (!this.isModified("workflow_stages")) return;
 
@@ -325,6 +406,27 @@ jobSchema.pre("save", function () {
   };
 });
 
+// Sync job-level design_status from item statuses
+jobSchema.pre("save", function () {
+  const items = this.cart_items || [];
+  if (!items.length) return;
+
+  const total    = items.length;
+  const approved = items.filter(i => i.design_status === "approved").length;
+  const uploaded = items.filter(i => ["uploaded", "approved"].includes(i.design_status)).length;
+  const rejected = items.filter(i => i.design_status === "rejected").length;
+
+  if (approved === total) {
+    this.design_status = "approved";
+    if (!this.design_approved_at) this.design_approved_at = new Date();
+  } else if (rejected > 0) {
+    this.design_status = "rejected";
+  } else if (uploaded > 0) {
+    this.design_status = "partial";
+  }
+  // else leave as-is (pending / uploaded set by uploadDesign for legacy)
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Soft-Delete Query Middleware
 // ════════════════════════════════════════════════════════════════════════════
@@ -338,7 +440,7 @@ jobSchema.query.includeDeleted = function () {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-// Instance Methods
+// Instance Methods — Session Management
 // ════════════════════════════════════════════════════════════════════════════
 
 jobSchema.methods.getActiveStage = function (stageName) {
@@ -430,6 +532,174 @@ jobSchema.methods.getSessionSummary = function (stageName) {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// Instance Methods — Per-Item Design Helpers
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Find a cart item by its item_id string.
+ * Falls back to Mongoose subdoc _id if item_id is not set.
+ */
+jobSchema.methods.findCartItem = function (itemId) {
+  return (
+    this.cart_items.find(i => i.item_id === itemId) ||
+    this.cart_items.id(itemId) ||
+    null
+  );
+};
+
+/**
+ * Add one or more design files to a cart item.
+ * files: [{ url, file_name, file_type, label, caption, uploaded_by }]
+ */
+jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {}) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  const now = new Date();
+  for (const f of files) {
+    item.design_files.push({
+      url:         f.url,
+      file_name:   f.file_name   || "",
+      file_type:   f.file_type   || "",
+      label:       f.label       || "Other",
+      caption:     f.caption     || "",
+      uploaded_at: now,
+      uploaded_by: {
+        user_id: uploadedBy.user_id || null,
+        name:    uploadedBy.name    || "",
+      },
+    });
+  }
+
+  // Promote item design_status to "uploaded" if it was pending
+  if (item.design_status === "pending" || item.design_status === "rejected") {
+    item.design_status = "uploaded";
+  }
+
+  return item;
+};
+
+/**
+ * Remove a single design file from a cart item by file _id.
+ */
+jobSchema.methods.removeItemDesignFile = function (itemId, fileId) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  const before = item.design_files.length;
+  item.design_files = item.design_files.filter(f => f._id.toString() !== fileId.toString());
+
+  if (item.design_files.length === before) {
+    throw new Error(`Design file "${fileId}" not found on item "${itemId}".`);
+  }
+
+  // If no files remain, revert status to pending
+  if (!item.design_files.length && item.design_status === "uploaded") {
+    item.design_status = "pending";
+  }
+  return item;
+};
+
+/**
+ * Approve a cart item's design.
+ */
+jobSchema.methods.approveItemDesign = function (itemId, approvedBy = {}) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  item.design_status    = "approved";
+  item.design_approved_at = new Date();
+  item.design_approved_by = {
+    user_id: approvedBy.user_id || null,
+    name:    approvedBy.name    || "",
+  };
+  item.design_rejection_reason = "";
+  return item;
+};
+
+/**
+ * Reject a cart item's design with a reason.
+ */
+jobSchema.methods.rejectItemDesign = function (itemId, reason, rejectedBy = {}) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  item.design_status           = "rejected";
+  item.design_rejection_reason = reason || "";
+  item.design_approved_at      = null;
+  item.design_approved_by      = {};
+  return item;
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Instance Methods — Per-Item Designer Assignment Helpers
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Assign one or more designers to a specific cart item.
+ * designers: [{ user_id, name, role }]
+ * assignedBy: { user_id, name }
+ */
+jobSchema.methods.assignItemDesigners = function (itemId, designers = [], assignedBy = {}) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  const now = new Date();
+  for (const d of designers) {
+    // Prevent duplicate assignments for the same user
+    const already = item.designers.some(
+      ex => ex.user_id?.toString() === d.user_id?.toString()
+    );
+    if (already) continue;
+
+    item.designers.push({
+      user_id:    d.user_id,
+      name:       d.name   || "",
+      role:       d.role   || "designing team",
+      assigned_at: now,
+      assigned_by: {
+        user_id: assignedBy.user_id || null,
+        name:    assignedBy.name    || "",
+      },
+      status: "assigned",
+    });
+  }
+  return item;
+};
+
+/**
+ * Remove a designer from a cart item.
+ */
+jobSchema.methods.removeItemDesigner = function (itemId, designerUserId) {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  item.designers = item.designers.filter(
+    d => d.user_id?.toString() !== designerUserId.toString()
+  );
+  return item;
+};
+
+/**
+ * Update a designer's status on a specific item.
+ * status: "in_progress" | "uploaded" | "approved" | "rejected"
+ */
+jobSchema.methods.updateItemDesignerStatus = function (itemId, designerUserId, status, notes = "") {
+  const item = this.findCartItem(itemId);
+  if (!item) throw new Error(`Cart item "${itemId}" not found.`);
+
+  const assignment = item.designers.find(
+    d => d.user_id?.toString() === designerUserId.toString()
+  );
+  if (!assignment) throw new Error(`Designer not assigned to item "${itemId}".`);
+
+  assignment.status           = status;
+  assignment.status_updated_at = new Date();
+  if (notes) assignment.notes = notes;
+  return item;
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // Static Methods
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -438,7 +708,7 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
     .select(
       "job_no job_status current_stage workflow_stages " +
       "design_file design_status design_duration_seconds design_duration_display " +
-      "qc_images qc_status qc_notes qc_duration_display",
+      "qc_images qc_status qc_notes qc_duration_display cart_items",
     )
     .populate("workflow_stages.handled_by.user_id", "name role email")
     .populate("workflow_stages.assigned_by.user_id", "name role")
@@ -448,4 +718,3 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
 // Clear cache so updated schema is always used after changes
 delete mongoose.models.job;
 module.exports = mongoose.model("job", jobSchema);
-

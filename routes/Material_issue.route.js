@@ -81,7 +81,6 @@ module.exports = router;
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB-SCOPED ROUTES
 // Add these lines inside your existing job.routes.js:
-//
 //   const materialCtrl = require("../controller/material_issue.controller");
 //
 //   // Issue material for a specific job

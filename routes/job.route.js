@@ -25,7 +25,7 @@ const upload = multer({
   },
 });
 
-// ── Multer config for QC images (only used for legacy multipart uploads) ──────
+// ── Multer config for QC images ───────────────────────────────────────────────
 const qcStorage = multer.diskStorage({
   destination: (req, file, cb) => { cb(null, "uploads/qc/"); },
   filename:    (req, file, cb) => {
@@ -50,7 +50,7 @@ const optionalQcUpload = (req, res, next) => {
   if (ct.includes("multipart/form-data")) {
     return qcUpload.array("qc_images", 20)(req, res, next);
   }
-  next(); // JSON body — skip multer entirely, req.body already parsed by express.json()
+  next();
 };
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ router.post("/:id/complete-stage", job.completeStage);
 router.post("/:id/hold",           job.holdJob);
 router.post("/:id/reject",         job.rejectJob);
 
-// ── Design File ───────────────────────────────────────────────────────────────
+// ── Design File (job-level / legacy) ─────────────────────────────────────────
 router.post("/:id/upload_design",      upload.single("design_file"), job.uploadDesign);
 router.post("/:id/approve_design",     job.approveDesign);
 router.post("/:id/reject_design",      job.rejectDesign);
@@ -88,7 +88,6 @@ router.post("/:id/approve_production", job.approveProduction);
 router.post("/:id/approve_qc",         job.approveqc);
 
 // ── Quality Check ─────────────────────────────────────────────────────────────
-// optionalQcUpload: handles both JSON (S3 URLs) and multipart (file uploads)
 router.post("/:id/qc/update", optionalQcUpload, job.updateQC);
 router.post("/:id/qc/pass",   job.passQC);
 router.post("/:id/qc/fail",   job.failQC);
@@ -98,10 +97,46 @@ router.post("/:jobId/material/issue", material.issueMaterial);
 router.get( "/:jobId/material",       material.getJobMaterials);
 
 // ── History & Reports ─────────────────────────────────────────────────────────
-router.get("/:id/workflow", job.getWorkflowHistory);
+router.get("/:id/workflow",        job.getWorkflowHistory);
+router.get("/:id/design-summary",  job.getDesignSummary);
 
 // ── Conversion ────────────────────────────────────────────────────────────────
 router.post("/:id/convert",  job.convertToOrder);
 router.post("/:id/restore",  job.restoreJob);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PER-ITEM DESIGN ROUTES
+// NOTE: these must be declared before /:id to avoid Express matching
+//       "items" as an :id param — they use /:id/items/... so order is fine,
+//       but keep them grouped here for clarity.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Add design files to a cart item
+// POST /api/jobs/:id/items/:itemId/design-files
+router.post("/:id/items/:itemId/design-files", job.addItemDesignFiles);
+
+// Remove a single design file from a cart item
+// DELETE /api/jobs/:id/items/:itemId/design-files/:fileId
+router.delete("/:id/items/:itemId/design-files/:fileId", job.removeItemDesignFile);
+
+// Approve the design for a cart item
+// POST /api/jobs/:id/items/:itemId/approve-design
+router.post("/:id/items/:itemId/approve-design", job.approveItemDesign);
+
+// Reject the design for a cart item
+// POST /api/jobs/:id/items/:itemId/reject-design
+router.post("/:id/items/:itemId/reject-design", job.rejectItemDesign);
+
+// Assign designers to a cart item
+// POST /api/jobs/:id/items/:itemId/assign-designers
+router.post("/:id/items/:itemId/assign-designers", job.assignItemDesigners);
+
+// Remove a designer from a cart item
+// DELETE /api/jobs/:id/items/:itemId/designers/:designerUserId
+router.delete("/:id/items/:itemId/designers/:designerUserId", job.removeItemDesigner);
+
+// Update a designer's status on a cart item
+// PATCH /api/jobs/:id/items/:itemId/designers/:designerUserId/status
+router.patch("/:id/items/:itemId/designers/:designerUserId/status", job.updateItemDesignerStatus);
 
 module.exports = router;
