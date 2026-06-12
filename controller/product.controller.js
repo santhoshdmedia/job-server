@@ -19,7 +19,7 @@ const {
   isAreaUnit,
   generateProductCodes,
   previewProductCodes,
-} = require("../helper/productCode.helper");
+} = require("../helper/Productcode.helper");
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
 
