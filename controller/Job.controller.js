@@ -50,6 +50,7 @@ exports.createJob = async (req, res) => {
       total_amount, gst_no, payment_mode, payment_amount, balance_amount,
       design_charges, valid_until, notes, terms_and_conditions,
       created_by, created_by_admin_id,
+      site_visit_id, site_visit_no, site_visit_photos        
     } = req.body;
 
     const job_no = await generateJobNo();
@@ -88,6 +89,11 @@ exports.createJob = async (req, res) => {
       created_by:          created_by || "admin",
       created_by_admin_id: created_by_admin_id || null,
       converted_to_order:  false, deletedAt: null,
+
+      // ← ADD THESE TWO LINES
+      site_visit_id: site_visit_id || null,
+      site_visit_no: site_visit_no || "",
+      site_visit_photos: site_visit_photos || [],
     });
 
     console.log("createJob ✅ | job_no:", jobData.job_no);

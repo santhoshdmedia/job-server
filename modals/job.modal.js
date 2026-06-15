@@ -105,18 +105,15 @@ workflowStageSchema.methods.recomputeTotals = function () {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-Schema: Per-Item Design File
-// Each cart item has an array of these — one per uploaded file.
-// label  : e.g. "Cutting File", "Printing File", "Mockup", "Reference", etc.
-// caption: free-text note the designer can add.
 // ─────────────────────────────────────────────────────────────────────────────
 const itemDesignFileSchema = new Schema(
   {
     url:       { type: String, required: true },
     file_name: { type: String, default: "" },
-    file_type: { type: String, default: "" }, // JPEG | PNG | PDF | CDR | DXF …
-    label:     {
-      type: String,
-      enum: ["Cutting File", "Printing File", "Mockup", "Reference", "Final Artwork", "Other"],
+    file_type: { type: String, default: "" },
+    label: {
+      type:    String,
+      enum:    ["Cutting File", "Printing File", "Mockup", "Reference", "Final Artwork", "Other"],
       default: "Other",
     },
     caption:     { type: String, default: "" },
@@ -131,9 +128,6 @@ const itemDesignFileSchema = new Schema(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-Schema: Per-Item Designer Assignment
-// A single cart item can be assigned to multiple designers.
-// This tracks who is responsible for which item, their individual upload
-// status, and approval state.
 // ─────────────────────────────────────────────────────────────────────────────
 const itemDesignerAssignmentSchema = new Schema(
   {
@@ -141,16 +135,16 @@ const itemDesignerAssignmentSchema = new Schema(
     name:    { type: String, default: "" },
     role:    { type: String, default: "" },
 
-    assigned_at:  { type: Date, default: () => new Date() },
+    assigned_at: { type: Date, default: () => new Date() },
     assigned_by: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
     },
 
     // "assigned" | "in_progress" | "uploaded" | "approved" | "rejected"
-    status:           { type: String, default: "assigned" },
+    status:            { type: String, default: "assigned" },
     status_updated_at: { type: Date, default: null },
-    notes:            { type: String, default: "" },
+    notes:             { type: String, default: "" },
   },
   { _id: true, timestamps: false },
 );
@@ -169,47 +163,74 @@ const addressSchema = new Schema(
   { _id: false },
 );
 
+const paymentSchema = new Schema(
+  {
+    amount:        { type: Number, required: true },
+    method:        { type: String, default: "" },
+    paid_at:       { type: Date, default: () => new Date() },
+    notes:         { type: String, default: "" },
+    next_due_date: { type: Date },
+    balance_after: { type: Number },
+  },
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cart Item Sub-Schema
 // ─────────────────────────────────────────────────────────────────────────────
 const jobCartItemSchema = new Schema(
   {
-    // ── A stable client-side key so the frontend can always reference the item
+    // ── Stable client-side key ────────────────────────────────────────────
     item_id: { type: String, default: "" },
 
-    product_id:    { type: String,  default: "" },
+    // ── Category discriminator ────────────────────────────────────────────
+    // "product" | "service_office" | "service_labour"
+    item_category: { type: String, default: "product" },
+
+    // ── Common fields ─────────────────────────────────────────────────────
+    product_id:    { type: String, default: "" },
     product_name:  { type: String },
     printing_type: { type: String },
     variation:     { type: String },
-    quantity:      { type: Number,  min: 1 },
-    quantity_type: { type: String,  default: "pcs" },
-    price:         { type: Number,  min: 0 },
-
-    sq_ft:        { type: Number,  default: 0 },
-    sq_ft_manual: { type: Boolean, default: false },
-
-    width:     { type: String, default: "" },
-    height:    { type: String, default: "" },
-    size_unit: { type: String, default: "" },
-    size:      { type: String, default: "" },
+    quantity:      { type: Number, min: 0 },
+    quantity_type: { type: String, default: "pcs" },
+    price:         { type: Number, min: 0 },
 
     gst_percentage: { type: Number, default: 0 },
     gst_amount:     { type: Number, default: 0 },
     line_base:      { type: Number, default: 0 },
     line_total:     { type: Number, default: 0 },
 
-    // ── Legacy single design file (kept for backward compat) ──────────────
+    notes: { type: String, default: "" },
+
+    // ── Product-specific ──────────────────────────────────────────────────
+    sq_ft:        { type: Number, default: 0 },
+    sq_ft_manual: { type: Boolean, default: false },
+    width:        { type: String, default: "" },
+    height:       { type: String, default: "" },
+    size_unit:    { type: String, default: "" },
+    size:         { type: String, default: "" },
+
+    // Legacy single design file (kept for backward compat)
     design_file: { type: String, default: "" },
 
-    notes: { type: String, default: "" },
+    // ── Office Work Service fields ────────────────────────────────────────
+    office_type:  { type: String, default: "" },
+    days:         { type: Number, default: 0 },
+    hours:        { type: Number, default: 0 },
+    reels_count:  { type: Number, default: 0 },
+    post_count:   { type: Number, default: 0 },
+
+    // ── Labour Work fields ────────────────────────────────────────────────
+    price_per_sqft: { type: Number, default: 0 },
+    price_per_hour: { type: Number, default: 0 },
 
     // ── Material Issue fields ─────────────────────────────────────────────
     outsource_type:   { type: String, default: "none" },
     outsource_vendor: { type: String, default: "" },
 
     material_issue_id: {
-      type: Schema.Types.ObjectId,
-      ref:  "MaterialIssue",
+      type:    Schema.Types.ObjectId,
+      ref:     "MaterialIssue",
       default: null,
     },
 
@@ -227,20 +248,19 @@ const jobCartItemSchema = new Schema(
       role:    { type: String, default: "" },
     },
 
-    // ── NEW: Per-item design files (array, each with label + caption) ─────
+    // ── Per-item design files (array, each with label + caption) ──────────
     design_files: { type: [itemDesignFileSchema], default: [] },
 
-    // ── NEW: Per-item design workflow status ──────────────────────────────
-    // "pending" | "uploaded" | "approved" | "rejected"
-    design_status: { type: String, default: "pending" },
+    // ── Per-item design workflow ──────────────────────────────────────────
+    design_status:           { type: String, default: "pending" },
     design_rejection_reason: { type: String, default: "" },
-    design_approved_at: { type: Date, default: null },
+    design_approved_at:      { type: Date,   default: null },
     design_approved_by: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
     },
 
-    // ── NEW: Per-item designer assignments (supports multiple designers) ──
+    // ── Per-item designer assignments (supports multiple) ─────────────────
     designers: { type: [itemDesignerAssignmentSchema], default: [] },
   },
   { _id: true },
@@ -293,7 +313,6 @@ const jobSchema = new Schema(
     design_uploaded_by:      { type: String,  default: "" },
     design_duration_seconds: { type: Number,  default: 0 },
     design_duration_display: { type: String,  default: "00:00:00" },
-    // "pending" | "partial" | "uploaded" | "approved" | "rejected"
     design_status:           { type: String,  default: "pending" },
     design_rejection_reason: { type: String,  default: "" },
     design_approved_at:      { type: Date },
@@ -329,9 +348,12 @@ const jobSchema = new Schema(
     free_delivery:        { type: Boolean, default: false },
     total_amount:         { type: Number,  required: true },
     gst_no:               { type: String,  default: "" },
-    payment_mode:         { type: String,  default: "" },
+    payment:              { type: paymentSchema, default: null },
     payment_amount:       { type: Number,  default: 0 },
     balance_amount:       { type: Number,  default: 0 },
+
+    next_due_date:        { type: Date,    default: null },
+
     design_charges:       { type: Number,  default: 0 },
     valid_until:          { type: Date,    required: true },
     notes:                { type: String,  default: "" },
@@ -353,6 +375,28 @@ const jobSchema = new Schema(
     },
     approved_by_admin_id: {
       type: Schema.Types.ObjectId, ref: "admin_users", default: null, index: true,
+    },
+
+    // ── ✅ Site Visit back-reference ───────────────────────────────────────
+    // Populated when a job is created from a site visit ("Convert to Job Sheet").
+    // Allows bidirectional lookup: given a job, find its originating site visit.
+    site_visit_id: {
+      type:    Schema.Types.ObjectId,
+      ref:     "SiteVisit",   // matches the model name in site-visit.model.js
+      default: null,
+      index:   true,
+    },
+    site_visit_photos: {
+      type: [Object], 
+      default: [],
+    },
+
+    // Human-readable visit number stored as a string for quick display
+    // without an extra populate call (e.g. "SV-20250615-001").
+    site_visit_no: {
+      type:    String,
+      default: "",
+      index:   true,
     },
   },
   { collection: "job", timestamps: true },
@@ -408,7 +452,9 @@ jobSchema.pre("save", function () {
 
 // Sync job-level design_status from item statuses
 jobSchema.pre("save", function () {
-  const items = this.cart_items || [];
+  const items = (this.cart_items || []).filter(
+    i => i.item_category === "product" || i.item_category === "service_office" || !i.item_category,
+  );
   if (!items.length) return;
 
   const total    = items.length;
@@ -424,7 +470,6 @@ jobSchema.pre("save", function () {
   } else if (uploaded > 0) {
     this.design_status = "partial";
   }
-  // else leave as-is (pending / uploaded set by uploadDesign for legacy)
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -484,8 +529,8 @@ jobSchema.methods.openSession = function ({ stageName, stageLabel = "", user, as
 
   stageEntry.work_sessions.push({
     user_id:       user.user_id || null,
-    name:          user.name   || "",
-    role:          user.role   || "",
+    name:          user.name    || "",
+    role:          user.role    || "",
     session_start: now,
     session_end:   null,
     work_date:     workDate,
@@ -535,10 +580,6 @@ jobSchema.methods.getSessionSummary = function (stageName) {
 // Instance Methods — Per-Item Design Helpers
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Find a cart item by its item_id string.
- * Falls back to Mongoose subdoc _id if item_id is not set.
- */
 jobSchema.methods.findCartItem = function (itemId) {
   return (
     this.cart_items.find(i => i.item_id === itemId) ||
@@ -547,10 +588,6 @@ jobSchema.methods.findCartItem = function (itemId) {
   );
 };
 
-/**
- * Add one or more design files to a cart item.
- * files: [{ url, file_name, file_type, label, caption, uploaded_by }]
- */
 jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {}) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
@@ -571,7 +608,6 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
     });
   }
 
-  // Promote item design_status to "uploaded" if it was pending
   if (item.design_status === "pending" || item.design_status === "rejected") {
     item.design_status = "uploaded";
   }
@@ -579,9 +615,6 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
   return item;
 };
 
-/**
- * Remove a single design file from a cart item by file _id.
- */
 jobSchema.methods.removeItemDesignFile = function (itemId, fileId) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
@@ -593,33 +626,23 @@ jobSchema.methods.removeItemDesignFile = function (itemId, fileId) {
     throw new Error(`Design file "${fileId}" not found on item "${itemId}".`);
   }
 
-  // If no files remain, revert status to pending
   if (!item.design_files.length && item.design_status === "uploaded") {
     item.design_status = "pending";
   }
   return item;
 };
 
-/**
- * Approve a cart item's design.
- */
 jobSchema.methods.approveItemDesign = function (itemId, approvedBy = {}) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
 
-  item.design_status    = "approved";
-  item.design_approved_at = new Date();
-  item.design_approved_by = {
-    user_id: approvedBy.user_id || null,
-    name:    approvedBy.name    || "",
-  };
+  item.design_status           = "approved";
+  item.design_approved_at      = new Date();
+  item.design_approved_by      = { user_id: approvedBy.user_id || null, name: approvedBy.name || "" };
   item.design_rejection_reason = "";
   return item;
 };
 
-/**
- * Reject a cart item's design with a reason.
- */
 jobSchema.methods.rejectItemDesign = function (itemId, reason, rejectedBy = {}) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
@@ -635,67 +658,45 @@ jobSchema.methods.rejectItemDesign = function (itemId, reason, rejectedBy = {}) 
 // Instance Methods — Per-Item Designer Assignment Helpers
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Assign one or more designers to a specific cart item.
- * designers: [{ user_id, name, role }]
- * assignedBy: { user_id, name }
- */
 jobSchema.methods.assignItemDesigners = function (itemId, designers = [], assignedBy = {}) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
 
   const now = new Date();
   for (const d of designers) {
-    // Prevent duplicate assignments for the same user
-    const already = item.designers.some(
-      ex => ex.user_id?.toString() === d.user_id?.toString()
-    );
+    const already = item.designers.some(ex => ex.user_id?.toString() === d.user_id?.toString());
     if (already) continue;
 
     item.designers.push({
-      user_id:    d.user_id,
-      name:       d.name   || "",
-      role:       d.role   || "designing team",
+      user_id:     d.user_id,
+      name:        d.name   || "",
+      role:        d.role   || "designing team",
       assigned_at: now,
-      assigned_by: {
-        user_id: assignedBy.user_id || null,
-        name:    assignedBy.name    || "",
-      },
-      status: "assigned",
+      assigned_by: { user_id: assignedBy.user_id || null, name: assignedBy.name || "" },
+      status:      "assigned",
     });
   }
   return item;
 };
 
-/**
- * Remove a designer from a cart item.
- */
 jobSchema.methods.removeItemDesigner = function (itemId, designerUserId) {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
 
-  item.designers = item.designers.filter(
-    d => d.user_id?.toString() !== designerUserId.toString()
-  );
+  item.designers = item.designers.filter(d => d.user_id?.toString() !== designerUserId.toString());
   return item;
 };
 
-/**
- * Update a designer's status on a specific item.
- * status: "in_progress" | "uploaded" | "approved" | "rejected"
- */
 jobSchema.methods.updateItemDesignerStatus = function (itemId, designerUserId, status, notes = "") {
   const item = this.findCartItem(itemId);
   if (!item) throw new Error(`Cart item "${itemId}" not found.`);
 
-  const assignment = item.designers.find(
-    d => d.user_id?.toString() === designerUserId.toString()
-  );
+  const assignment = item.designers.find(d => d.user_id?.toString() === designerUserId.toString());
   if (!assignment) throw new Error(`Designer not assigned to item "${itemId}".`);
 
-  assignment.status           = status;
+  assignment.status            = status;
   assignment.status_updated_at = new Date();
-  if (notes) assignment.notes = notes;
+  if (notes) assignment.notes  = notes;
   return item;
 };
 
@@ -708,11 +709,32 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
     .select(
       "job_no job_status current_stage workflow_stages " +
       "design_file design_status design_duration_seconds design_duration_display " +
-      "qc_images qc_status qc_notes qc_duration_display cart_items",
+      "qc_images qc_status qc_notes qc_duration_display cart_items " +
+      "site_visit_id site_visit_no site_visit_photos",  
     )
     .populate("workflow_stages.handled_by.user_id", "name role email")
     .populate("workflow_stages.assigned_by.user_id", "name role")
     .lean();
+};
+
+/**
+ * Find all jobs that were converted from a specific site visit.
+ * Usage: Job.findBySiteVisit("6654abc...")
+ */
+jobSchema.statics.findBySiteVisit = function (siteVisitId) {
+  return this.find({ site_visit_id: siteVisitId }).sort({ createdAt: -1 }).lean();
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Static Helpers for Service Item Queries
+// ════════════════════════════════════════════════════════════════════════════
+
+jobSchema.statics.findByOfficeServiceType = function (officeType) {
+  return this.find({ "cart_items.item_category": "service_office", "cart_items.office_type": officeType });
+};
+
+jobSchema.statics.findWithLabourWork = function () {
+  return this.find({ "cart_items.item_category": "service_labour" });
 };
 
 // Clear cache so updated schema is always used after changes
