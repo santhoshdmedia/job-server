@@ -214,36 +214,87 @@ exports.updateJobStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveJob = async (req, res) => {
   try {
-    const { approved_by, approved_by_admin_id, assign_to, job_status } = req.body;
-    if (!approved_by || !approved_by_admin_id) return resp(res, 400, false, "Approver name and ID are required.");
-    if (!assign_to?.user_id) return resp(res, 400, false, "A designer must be assigned when approving.");
+    const { approved_by, approved_by_admin_id, assign_to, job_status, is_customer_designed } = req.body;
+
+    if (!approved_by || !approved_by_admin_id)
+      return resp(res, 400, false, "Approver name and ID are required.");
 
     const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    const designer = await AdminUsers.findById(assign_to.user_id);
-    if (!designer || designer.role !== "designing team")
-      return resp(res, 400, false, "Selected user is not a valid designer.");
-
     const now = new Date();
-    job.job_status = job_status || "accepted";
-    job.approved_by = approved_by; job.approved_by_admin_id = approved_by_admin_id;
-    job.status_updated_at = now;
+    job.approved_by          = approved_by;
+    job.approved_by_admin_id = approved_by_admin_id;
+    job.status_updated_at    = now;
 
-    job.workflow_stages.push({
-      stage: "design", stage_label: "Design",
-      handled_by:  { user_id: designer._id, name: designer.name, role: designer.role },
-      assigned_by: { user_id: approved_by_admin_id, name: approved_by },
-      action: "assigned", assigned_at: now, work_sessions: [],
-      notes: "Job approved and assigned by admin",
-    });
-    job.current_stage = {
-      stage: "design", stage_label: "Design", stage_action: "assigned",
-      assigned_to: { user_id: designer._id, name: designer.name, role: designer.role }, since: now,
-    };
+    // ── Branch: Customer-designed vs. Internal designer ───────────────────
+    if (is_customer_designed) {
+      job.job_status = job_status || "design";
+
+      job.workflow_stages.push({
+        stage:       "design",
+        stage_label: "Design",
+        handled_by:  { user_id: null, name: "Customer", role: "customer" },
+        assigned_by: { user_id: approved_by_admin_id, name: approved_by },
+        action:      "uploaded",          // ← key: marks as already uploaded
+        assigned_at: now,
+        started_at:  now,
+        completed_at: now,               // design is effectively done
+        work_sessions: [],
+        notes: "Design provided by customer — no internal designer assigned.",
+      });
+
+      job.current_stage = {
+        stage:        "design",
+        stage_label:  "Design",
+        stage_action: "uploaded",
+        assigned_to:  { user_id: null, name: "Customer", role: "customer" },
+        since:        now,
+      };
+
+      // Also update job-level design flags
+      job.design_status    = "uploaded";
+      job.design_is_sample = false;
+
+    } else {
+      // ── Internal designer path ──────────────────────────────────────────
+      if (!assign_to?.user_id)
+        return resp(res, 400, false, "A designer must be assigned when approving.");
+
+      const designer = await AdminUsers.findById(assign_to.user_id);
+      if (!designer || designer.role !== "designing team")
+        return resp(res, 400, false, "Selected user is not a valid designer.");
+
+      job.job_status = job_status || "design";
+
+      job.workflow_stages.push({
+        stage:       "design",
+        stage_label: "Design",
+        handled_by:  { user_id: designer._id, name: designer.name, role: designer.role },
+        assigned_by: { user_id: approved_by_admin_id, name: approved_by },
+        action:      "assigned",
+        assigned_at: now,
+        work_sessions: [],
+        notes: "Job approved and assigned by admin.",
+      });
+
+      job.current_stage = {
+        stage:        "design",
+        stage_label:  "Design",
+        stage_action: "assigned",
+        assigned_to:  { user_id: designer._id, name: designer.name, role: designer.role },
+        since:        now,
+      };
+    }
 
     await job.save();
-    return resp(res, 200, true, `Job approved and assigned to ${designer.name}.`, job);
+
+    const msg = is_customer_designed
+      ? "Job approved — customer-provided design marked as uploaded."
+      : `Job approved and assigned to ${assign_to?.name || "designer"}.`;
+
+    return resp(res, 200, true, msg, job);
+
   } catch (err) {
     console.error("approveJob ❌", err);
     return resp(res, 500, false, err.message);
