@@ -122,6 +122,25 @@ const itemDesignFileSchema = new Schema(
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
     },
+
+    // ── NEW FIELDS for per‑file assignment ──────────────────────────────
+    assigned_to: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+    work_status: {
+      type:    String,
+      default: "pending",
+    },
+    work_notes:      { type: String, default: "" },
+    approved_at:     { type: Date, default: null },
+    rejection_reason: { type: String, default: "" },
+    material_issue_id: {
+      type:    Schema.Types.ObjectId,
+      ref:     "MaterialIssue",
+      default: null,
+    },
   },
   { _id: true, timestamps: false },
 );
@@ -594,7 +613,7 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
 
   const now = new Date();
   for (const f of files) {
-    item.design_files.push({
+    const fileData = {
       url:         f.url,
       file_name:   f.file_name   || "",
       file_type:   f.file_type   || "",
@@ -605,9 +624,22 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
         user_id: uploadedBy.user_id || null,
         name:    uploadedBy.name    || "",
       },
-    });
+    };
+    // Accept per‑file assignment
+    if (f.assigned_to) {
+      fileData.assigned_to = {
+        user_id: f.assigned_to.user_id || null,
+        name:    f.assigned_to.name    || "",
+        role:    f.assigned_to.role    || "",
+      };
+    }
+    if (f.work_status) fileData.work_status = f.work_status;
+    if (f.work_notes)  fileData.work_notes  = f.work_notes;
+
+    item.design_files.push(fileData);
   }
 
+  // Update item design status if it was pending or rejected
   if (item.design_status === "pending" || item.design_status === "rejected") {
     item.design_status = "uploaded";
   }
