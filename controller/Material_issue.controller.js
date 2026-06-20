@@ -7,12 +7,12 @@
 //   5. Manager review
 //   6. Reporting
 //
-// KEY CHANGES (v2):
+// KEY CHANGES (v3):
 //  • issueMaterial handles calc_mode "dimensions" (printing + media dims)
 //  • issueForDesignFile — issue material tied to a specific design file _id
-//    (used when a designer uploads photo-per-work and each photo triggers
-//     its own material issue to a specific assignee)
 //  • Stock is NOT decremented for outsource issues (calc_mode "outsource")
+//  • issued_to is OPTIONAL for in-house (falls back to design file's assigned_to)
+//  • outsource issued_to.user_id is always null (vendor stored in outsource_vendor)
 
 const mongoose      = require("mongoose");
 const MaterialIssue = require("../modals/Material_issue.model");
@@ -64,9 +64,9 @@ const buildReturnSummary = (issue) => {
   const calc = issue.calculation;
   if (!r) return null;
   return {
-    efficiency_pct: parseFloat(((r.actual_used_qty / issue.issued_qty) * 100).toFixed(2)),
-    over_issued_sqft: parseFloat((issue.issued_qty - (calc.required_sqft || 0)).toFixed(4)),
-    actual_vs_expected_wastage: parseFloat((r.actual_wastage_qty - r.expected_wastage_qty).toFixed(4)),
+    efficiency_pct:                  parseFloat(((r.actual_used_qty / issue.issued_qty) * 100).toFixed(2)),
+    over_issued_sqft:                parseFloat((issue.issued_qty - (calc.required_sqft || 0)).toFixed(4)),
+    actual_vs_expected_wastage:      parseFloat((r.actual_wastage_qty - r.expected_wastage_qty).toFixed(4)),
     verdict:
       r.performance_rating === "good"        ? "Great — material used efficiently."
       : r.performance_rating === "acceptable" ? "Within acceptable range."
@@ -102,9 +102,12 @@ const computeJobTotals = (issues) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal: build the calculation snapshot from request body.
-// Returns { calc, dimensionRecord, isOutsourced, effectiveCalcMode }
+// Returns { calc, dimensionRecord, printDim, mediaDim, wastageSq, effectiveMode }
 // ─────────────────────────────────────────────────────────────────────────────
-const buildCalculation = ({ calc_mode, sq_ft, dimensions, printing_dimensions, media_dimensions, margin_top_in, margin_bottom_in, wastage_buffer_pct, outsource_type }) => {
+const buildCalculation = ({
+  calc_mode, sq_ft, dimensions, printing_dimensions, media_dimensions,
+  margin_top_in, margin_bottom_in, wastage_buffer_pct, outsource_type,
+}) => {
   const buf        = parseFloat(wastage_buffer_pct) || 0;
   const isOut      = outsource_type && outsource_type !== "none";
   const effectiveMode = isOut ? "outsource" : (calc_mode || "server");
@@ -116,21 +119,26 @@ const buildCalculation = ({ calc_mode, sq_ft, dimensions, printing_dimensions, m
   let wastageSq = 0;
 
   if (effectiveMode === "outsource") {
-    // Outsource: no stock deduction, optional dimension capture
-    const pFtW = printing_dimensions ? toFeet(printing_dimensions.width, printing_dimensions.unit || printing_dimensions.width_unit) : 0;
+    const pFtW = printing_dimensions ? toFeet(printing_dimensions.width,  printing_dimensions.unit || printing_dimensions.width_unit)  : 0;
     const pFtH = printing_dimensions ? toFeet(printing_dimensions.height, printing_dimensions.unit || printing_dimensions.height_unit) : 0;
-    const mFtW = media_dimensions    ? toFeet(media_dimensions.width,    media_dimensions.unit    || media_dimensions.width_unit)    : 0;
-    const mFtH = media_dimensions    ? toFeet(media_dimensions.height,   media_dimensions.unit    || media_dimensions.height_unit)   : 0;
+    const mFtW = media_dimensions    ? toFeet(media_dimensions.width,     media_dimensions.unit    || media_dimensions.width_unit)     : 0;
+    const mFtH = media_dimensions    ? toFeet(media_dimensions.height,    media_dimensions.unit    || media_dimensions.height_unit)    : 0;
     const pSq  = parseFloat((pFtW * pFtH).toFixed(4));
     const mSq  = parseFloat((mFtW * mFtH).toFixed(4));
 
-    calc = { print_sqft: pSq, media_sqft: mSq, wastage_sqft: parseFloat((mSq - pSq).toFixed(4)), wastage_buffer_pct: 0, buffer_sqft: 0, required_sqft: mSq };
+    calc = {
+      print_sqft:         pSq,
+      media_sqft:         mSq,
+      wastage_sqft:       parseFloat((mSq - pSq).toFixed(4)),
+      wastage_buffer_pct: 0,
+      buffer_sqft:        0,
+      required_sqft:      mSq,
+    };
     if (printing_dimensions) printDim = { width: printing_dimensions.width, height: printing_dimensions.height, unit: printing_dimensions.unit || printing_dimensions.width_unit || "ft", sqft: pSq };
     if (media_dimensions)    mediaDim = { width: media_dimensions.width,    height: media_dimensions.height,    unit: media_dimensions.unit    || media_dimensions.width_unit    || "ft", sqft: mSq };
     wastageSq = parseFloat((mSq - pSq).toFixed(4));
 
   } else if (effectiveMode === "dimensions") {
-    // Frontend two-dimension mode: printing area + media area
     const pd    = printing_dimensions || {};
     const md    = media_dimensions    || {};
     const pUnit = pd.unit || pd.width_unit || "ft";
@@ -149,15 +157,15 @@ const buildCalculation = ({ calc_mode, sq_ft, dimensions, printing_dimensions, m
     mediaDim   = { width: md.width, height: md.height, unit: mUnit, sqft: mSq };
     wastageSq  = Math.max(0, waste);
     calc = {
-      print_sqft:    pSq,
-      media_sqft:    mSq,
-      wastage_sqft:  wastageSq,
-      wastage_buffer_pct: buf,
-      buffer_sqft:   bufSq,
-      required_sqft: req,
-      job_sqft:      pSq,    // alias for return calc
-      gross_sqft:    mSq,    // alias for return calc
-      margin_sqft:   0,
+      print_sqft:           pSq,
+      media_sqft:           mSq,
+      wastage_sqft:         wastageSq,
+      wastage_buffer_pct:   buf,
+      buffer_sqft:          bufSq,
+      required_sqft:        req,
+      job_sqft:             pSq,
+      gross_sqft:           mSq,
+      margin_sqft:          0,
       margin_top_inches:    0,
       margin_bottom_inches: 0,
     };
@@ -185,15 +193,15 @@ const buildCalculation = ({ calc_mode, sq_ft, dimensions, printing_dimensions, m
       wastage_buffer_pct: buf,
     });
     calc = {
-      job_sqft:    serverCalc.job_sqft,
-      margin_sqft: serverCalc.margin_sqft,
-      gross_sqft:  serverCalc.gross_sqft,
-      print_sqft:  serverCalc.job_sqft,
-      media_sqft:  serverCalc.gross_sqft,
-      wastage_sqft: parseFloat((serverCalc.gross_sqft - serverCalc.job_sqft).toFixed(4)),
-      wastage_buffer_pct: buf,
-      buffer_sqft: parseFloat((serverCalc.gross_sqft * buf / 100).toFixed(4)),
-      required_sqft: serverCalc.required_sqft,
+      job_sqft:             serverCalc.job_sqft,
+      margin_sqft:          serverCalc.margin_sqft,
+      gross_sqft:           serverCalc.gross_sqft,
+      print_sqft:           serverCalc.job_sqft,
+      media_sqft:           serverCalc.gross_sqft,
+      wastage_sqft:         parseFloat((serverCalc.gross_sqft - serverCalc.job_sqft).toFixed(4)),
+      wastage_buffer_pct:   buf,
+      buffer_sqft:          parseFloat((serverCalc.gross_sqft * buf / 100).toFixed(4)),
+      required_sqft:        serverCalc.required_sqft,
       margin_top_inches:    parseFloat(margin_top_in)    || 4,
       margin_bottom_inches: parseFloat(margin_bottom_in) || 3,
     };
@@ -210,8 +218,8 @@ const buildCalculation = ({ calc_mode, sq_ft, dimensions, printing_dimensions, m
 exports.calculateMaterial = (req, res) => {
   try {
     const { width_ft, height_ft, margin_top_in = 4, margin_bottom_in = 3, wastage_buffer_pct = 20 } = req.body;
-    if (!width_ft || !height_ft) return resp(res, 400, false, "width_ft and height_ft are required.");
-    if (width_ft <= 0 || height_ft <= 0) return resp(res, 400, false, "Dimensions must be greater than 0.");
+    if (!width_ft || !height_ft)          return resp(res, 400, false, "width_ft and height_ft are required.");
+    if (width_ft <= 0 || height_ft <= 0)  return resp(res, 400, false, "Dimensions must be greater than 0.");
 
     const calc = MaterialIssue.calculateRequired({ width_ft, height_ft, margin_top_in, margin_bottom_in, wastage_buffer_pct });
 
@@ -234,14 +242,20 @@ exports.calculateMaterial = (req, res) => {
 };
 
 // =============================================================================
-// 2. ISSUE MATERIAL  (store manager → employee)
+// 2. ISSUE MATERIAL  (store manager → employee / outsource vendor)
 // POST /api/jobs/:jobId/material/issue
 //
 // Supports three calc modes via body.calc_mode:
 //   "server"     — body.dimensions { width, height } → server calc
 //   "sqft"       — body.sq_ft (flat sqft from cart)
 //   "dimensions" — body.printing_dimensions + body.media_dimensions
-//   "outsource"  — outsourced; no stock deduction; vendor stored
+//   "outsource"  — outsourced; no stock deduction; vendor stored in outsource_vendor
+//
+// KEY NOTES:
+//   • For in-house:  issued_to is used if provided; if not, falls back to
+//     the assigned_to of the referenced design file.
+//   • For outsource: issued_to.name = vendor name, issued_to.user_id = null.
+//     No slip is generated by the backend; frontend skips slip generation too.
 // =============================================================================
 exports.issueMaterial = async (req, res) => {
   try {
@@ -280,15 +294,10 @@ exports.issueMaterial = async (req, res) => {
     if (!issued_by?.user_id || !issued_by?.name)
       return resp(res, 400, false, "issued_by.user_id and issued_by.name are required.");
 
-    if (isOutsourced) {
-      if (!outsource_vendor?.trim())
-        return resp(res, 400, false, "outsource_vendor is required for outsourced work.");
-    } else {
-      if (!issued_to?.user_id || !issued_to?.name)
-        return resp(res, 400, false, "issued_to.user_id and issued_to.name are required for in-house work.");
-    }
+    if (isOutsourced && !outsource_vendor?.trim())
+      return resp(res, 400, false, "outsource_vendor is required for outsourced work.");
 
-    // dimension presence checks
+    // Dimension presence checks (only for non-outsource)
     if (!isOutsourced) {
       if (calc_mode === "sqft" && (!parseFloat(sq_ft) || parseFloat(sq_ft) <= 0))
         return resp(res, 400, false, "sq_ft must be > 0 when calc_mode is 'sqft'.");
@@ -307,7 +316,6 @@ exports.issueMaterial = async (req, res) => {
       product = await Product.findById(material.product_id).lean();
       if (!product) return resp(res, 404, false, "Material product not found.");
 
-      // Stock check (skip for outsource)
       const available = product.stock_count || 0;
       const qtyNeeded = parseFloat(issued_qty) || 0;
       if (available < qtyNeeded)
@@ -316,9 +324,46 @@ exports.issueMaterial = async (req, res) => {
         );
     }
 
-    if (!isOutsourced) {
-      const employee = await AdminUsers.findById(issued_to.user_id).lean();
-      if (!employee) return resp(res, 404, false, "Employee (issued_to) not found.");
+    // ── Resolve issued_to ─────────────────────────────────────────────────────
+    // For outsource: vendor name goes into issued_to.name, user_id = null
+    // For in-house:  use provided issued_to if present, else fall back to
+    //                the design file's assigned_to (assignment was done upstream)
+    let resolvedIssuedTo = { user_id: null, name: "", role: "" };
+
+    if (isOutsourced) {
+      resolvedIssuedTo = {
+        user_id: null,
+        name:    outsource_vendor.trim(),
+        role:    "outsource",
+      };
+    } else {
+      // Try provided issued_to first
+      if (issued_to?.user_id) {
+        resolvedIssuedTo = {
+          user_id: issued_to.user_id,
+          name:    issued_to.name || "",
+          role:    issued_to.role || "",
+        };
+      } else if (design_file_id) {
+        // Fall back to design file's assigned_to
+        const cartItem = job.cart_items?.[cart_item_index];
+        const designFile = cartItem?.design_files?.find(f => f._id?.toString() === design_file_id);
+        if (designFile?.assigned_to?.user_id) {
+          resolvedIssuedTo = {
+            user_id: designFile.assigned_to.user_id,
+            name:    designFile.assigned_to.name || "",
+            role:    designFile.assigned_to.role || "",
+          };
+        }
+      }
+      // Validate employee exists if we have a user_id
+      if (resolvedIssuedTo.user_id) {
+        const employee = await AdminUsers.findById(resolvedIssuedTo.user_id).lean();
+        if (!employee) {
+          // Non-fatal: keep the name from the payload but log
+          console.warn(`issueMaterial: employee ${resolvedIssuedTo.user_id} not found, using name from payload`);
+        }
+      }
     }
 
     // ── Build calculation snapshot ───────────────────────────────────────────
@@ -331,11 +376,6 @@ exports.issueMaterial = async (req, res) => {
     const issue_no       = await MaterialIssue.generateIssueNo();
     const cartItem       = job.cart_items?.[cart_item_index];
     const cart_item_name = cartItem?.product_name || cartItem?.name || "";
-
-    const resolvedIssuedToName = isOutsourced
-      ? (outsource_vendor.trim() || issued_to?.name || "")
-      : (issued_to?.name || "");
-
     const resolvedOutsourceVendor = isOutsourced ? outsource_vendor.trim() : "";
     const qty = parseFloat(issued_qty) || 0;
 
@@ -349,7 +389,7 @@ exports.issueMaterial = async (req, res) => {
       cart_item_index,
       cart_item_id:    cart_item_id || cartItem?.item_id || "",
       cart_item_name,
-      design_file_id:    design_file_id  ? new mongoose.Types.ObjectId(design_file_id)  : null,
+      design_file_id:    design_file_id ? new mongoose.Types.ObjectId(design_file_id) : null,
       design_file_label: design_file_label || "",
       material: {
         product_id:   isOutsourced ? null : material?.product_id,
@@ -359,11 +399,7 @@ exports.issueMaterial = async (req, res) => {
       issued_qty:    qty,
       suggested_qty: calc.required_sqft,
       issued_at:     new Date(),
-      issued_to: {
-        user_id: isOutsourced ? null : issued_to.user_id,
-        name:    resolvedIssuedToName,
-        role:    isOutsourced ? "outsource" : (issued_to.role || ""),
-      },
+      issued_to:     resolvedIssuedTo,
       issued_by: {
         user_id: issued_by.user_id,
         name:    issued_by.name,
@@ -380,7 +416,7 @@ exports.issueMaterial = async (req, res) => {
       status: "issued",
     });
 
-    // ── Write issue reference + outsource info back to Job cart_item ─────────
+    // ── Write issue reference back to Job cart_item ──────────────────────────
     const cartUpdateFields = {
       [`cart_items.${cart_item_index}.outsource_type`]:    outsource_type,
       [`cart_items.${cart_item_index}.outsource_vendor`]:  resolvedOutsourceVendor,
@@ -391,14 +427,10 @@ exports.issueMaterial = async (req, res) => {
         name:    issued_by.name,
         role:    issued_by.role || "",
       },
-      [`cart_items.${cart_item_index}.issued_to`]: {
-        user_id: isOutsourced ? null : issued_to.user_id,
-        name:    resolvedIssuedToName,
-        role:    isOutsourced ? "outsource" : (issued_to.role || ""),
-      },
+      [`cart_items.${cart_item_index}.issued_to`]: resolvedIssuedTo,
     };
 
-    // If this issue is tied to a specific design file, stamp material_issue_id on it too
+    // If tied to a specific design file, stamp material_issue_id on that file too
     if (design_file_id) {
       cartUpdateFields[
         `cart_items.${cart_item_index}.design_files.$[file].material_issue_id`
@@ -413,7 +445,7 @@ exports.issueMaterial = async (req, res) => {
         : {}
     );
 
-    // ── Decrement stock (skip for outsource) ─────────────────────────────────
+    // ── Decrement stock (SKIP for outsource) ─────────────────────────────────
     if (!isOutsourced && material?.product_id && qty > 0) {
       await decrementStock(
         material.product_id, qty, issued_by.name,
@@ -428,7 +460,7 @@ exports.issueMaterial = async (req, res) => {
       material_name:       issue.material.product_name,
       issued_qty:          qty,
       suggested_qty:       calc.required_sqft,
-      issued_to:           resolvedIssuedToName,
+      issued_to:           resolvedIssuedTo.name,
       outsource_type,
       outsource_vendor:    resolvedOutsourceVendor,
       calc_mode:           effectiveMode,
@@ -447,29 +479,23 @@ exports.issueMaterial = async (req, res) => {
 // =============================================================================
 // 2b. ISSUE MATERIAL FOR A SPECIFIC DESIGN FILE
 // POST /api/jobs/:jobId/items/:itemId/design-files/:fileId/material/issue
-//
-// Convenience wrapper — pulls item/file context from the Job document,
-// then delegates to the same issuance logic.  The caller only needs to
-// provide material, issued_to, issued_by, dims, and optional overrides.
 // =============================================================================
 exports.issueForDesignFile = async (req, res) => {
   const { jobId, itemId, fileId } = req.params;
 
-  // Locate the item and file to extract cart_item_index
   const job = await Job.findById(jobId).lean();
   if (!job) return resp(res, 404, false, "Job not found.");
 
-  const idx  = job.cart_items?.findIndex(i => i.item_id === itemId || i._id?.toString() === itemId);
+  const idx = job.cart_items?.findIndex(i => i.item_id === itemId || i._id?.toString() === itemId);
   if (idx === -1 || idx === undefined) return resp(res, 404, false, "Cart item not found.");
 
   const item = job.cart_items[idx];
   const file = item.design_files?.find(f => f._id?.toString() === fileId);
   if (!file) return resp(res, 404, false, "Design file not found on cart item.");
 
-  // Inject resolved fields into body and forward to issueMaterial
-  req.body.cart_item_index  = idx;
-  req.body.cart_item_id     = itemId;
-  req.body.design_file_id   = fileId;
+  req.body.cart_item_index   = idx;
+  req.body.cart_item_id      = itemId;
+  req.body.design_file_id    = fileId;
   req.body.design_file_label = file.label || "";
 
   return exports.issueMaterial(req, res);
@@ -607,7 +633,7 @@ exports.managerReview = async (req, res) => {
     return resp(res, 200, true, "Manager review recorded.", {
       issue_no: issue.issue_no, job_no: issue.job_no,
       performance_rating: issue.return.performance_rating,
-      is_flagged: issue.return.is_flagged,
+      is_flagged:         issue.return.is_flagged,
     });
   } catch (err) {
     console.error("managerReview:", err);
@@ -630,8 +656,8 @@ exports.updateManagerReview = async (req, res) => {
     if (!issue)        return resp(res, 404, false, "Material issue record not found.");
     if (!issue.return) return resp(res, 400, false, "No return recorded yet.");
 
-    if (manager_notes !== undefined) issue.return.manager_notes    = manager_notes;
-    if (manager_by)                  issue.return.manager_review_by = manager_by;
+    if (manager_notes !== undefined)  issue.return.manager_notes    = manager_notes;
+    if (manager_by)                   issue.return.manager_review_by = manager_by;
     issue.return.manager_review_at = new Date();
     issue.return.manager_reviewed  = true;
 
@@ -660,9 +686,9 @@ exports.getJobMaterials = async (req, res) => {
 
     const issues = await MaterialIssue.find({ job_id: jobId, is_deleted: false })
       .sort({ createdAt: -1 })
-      .populate("issued_to.user_id", "name role email")
-      .populate("issued_by.user_id", "name role")
-      .populate("material.product_id", "name stock_count")
+      .populate("issued_to.user_id",       "name role email")
+      .populate("issued_by.user_id",       "name role")
+      .populate("material.product_id",     "name stock_count")
       .lean();
 
     return resp(res, 200, true, "Material issues for job fetched.", {
@@ -720,10 +746,10 @@ exports.getIssuesByDesignFile = async (req, res) => {
 exports.getMaterialIssue = async (req, res) => {
   try {
     const issue = await MaterialIssue.findById(req.params.issueId)
-      .populate("issued_to.user_id", "name role email")
-      .populate("issued_by.user_id", "name role")
+      .populate("issued_to.user_id",   "name role email")
+      .populate("issued_by.user_id",   "name role")
       .populate("material.product_id", "name stock_count stocks_status")
-      .populate("job_id", "job_no job_status current_stage")
+      .populate("job_id",              "job_no job_status current_stage")
       .lean();
 
     if (!issue) return resp(res, 404, false, "Material issue not found.");
@@ -751,9 +777,9 @@ exports.getEmployeeMaterials = async (req, res) => {
     const filter = { "issued_to.user_id": new mongoose.Types.ObjectId(userId), is_deleted: false };
     if (status) filter.status = status;
 
-    const skip  = (parseInt(page) - 1) * parseInt(limit);
-    const sort  = { [sort_by]: sort_order === "asc" ? 1 : -1 };
-    const total = await MaterialIssue.countDocuments(filter);
+    const skip   = (parseInt(page) - 1) * parseInt(limit);
+    const sort   = { [sort_by]: sort_order === "asc" ? 1 : -1 };
+    const total  = await MaterialIssue.countDocuments(filter);
     const issues = await MaterialIssue.find(filter).sort(sort).skip(skip).limit(parseInt(limit))
       .populate("material.product_id", "name").lean();
 
@@ -772,11 +798,12 @@ exports.getEmployeeMaterials = async (req, res) => {
       user_id: userId, issues,
       pagination: { total, page: parseInt(page), limit: parseInt(limit), total_pages: Math.ceil(total / parseInt(limit)) },
       employee_stats: {
-        total_issues: total, returned_count: allReturned.length,
-        pending_return: total - allReturned.length,
-        avg_wastage_pct: avgWastage,
-        performance_counts: ratingCounts,
-        overall_rating: MaterialIssue.ratePerformance(avgWastage),
+        total_issues:        total,
+        returned_count:      allReturned.length,
+        pending_return:      total - allReturned.length,
+        avg_wastage_pct:     avgWastage,
+        performance_counts:  ratingCounts,
+        overall_rating:      MaterialIssue.ratePerformance(avgWastage),
       },
     });
   } catch (err) {
@@ -798,10 +825,10 @@ exports.getAllMaterialIssues = async (req, res) => {
     } = req.query;
 
     const filter = { is_deleted: false };
-    if (status)         filter.status               = status;
-    if (job_no)         filter.job_no               = new RegExp(job_no, "i");
-    if (is_flagged)     filter["return.is_flagged"]  = is_flagged === "true";
-    if (outsource_type) filter.outsource_type        = outsource_type;
+    if (status)          filter.status               = status;
+    if (job_no)          filter.job_no               = new RegExp(job_no, "i");
+    if (is_flagged)      filter["return.is_flagged"]  = is_flagged === "true";
+    if (outsource_type)  filter.outsource_type        = outsource_type;
     if (manager_reviewed !== undefined)
       filter["return.manager_reviewed"] = manager_reviewed === "true";
     if (employee_id && mongoose.Types.ObjectId.isValid(employee_id))
@@ -809,11 +836,11 @@ exports.getAllMaterialIssues = async (req, res) => {
     if (product_id && mongoose.Types.ObjectId.isValid(product_id))
       filter["material.product_id"] = new mongoose.Types.ObjectId(product_id);
 
-    const skip  = (parseInt(page) - 1) * parseInt(limit);
-    const sort  = { [sort_by]: sort_order === "asc" ? 1 : -1 };
-    const total = await MaterialIssue.countDocuments(filter);
+    const skip   = (parseInt(page) - 1) * parseInt(limit);
+    const sort   = { [sort_by]: sort_order === "asc" ? 1 : -1 };
+    const total  = await MaterialIssue.countDocuments(filter);
     const issues = await MaterialIssue.find(filter).sort(sort).skip(skip).limit(parseInt(limit))
-      .populate("issued_to.user_id", "name role")
+      .populate("issued_to.user_id",   "name role")
       .populate("material.product_id", "name").lean();
 
     return resp(res, 200, true, "Material issues fetched.", {
@@ -848,7 +875,7 @@ exports.wastageReport = async (req, res) => {
     const [overall] = await MaterialIssue.aggregate([
       { $match: matchStage },
       { $group: {
-        _id: null,
+        _id:                    null,
         total_records:          { $sum: 1 },
         total_issued_qty:       { $sum: "$issued_qty" },
         total_returned_qty:     { $sum: "$return.returned_qty" },
@@ -911,10 +938,12 @@ exports.wastageReport = async (req, res) => {
     ]);
 
     return resp(res, 200, true, "Wastage report generated.", {
-      period: { from: from || "all time", to: to || "now" },
-      overall: overall ? { ...overall, _id: undefined, avg_wastage_ratio: parseFloat((overall.avg_wastage_ratio || 0).toFixed(2)) } : null,
-      by_employee: byEmployee, by_material: byMaterial,
-      by_wastage_reason: byReason, by_outsource_type: byOutsourceType,
+      period:            { from: from || "all time", to: to || "now" },
+      overall:           overall ? { ...overall, _id: undefined, avg_wastage_ratio: parseFloat((overall.avg_wastage_ratio || 0).toFixed(2)) } : null,
+      by_employee:       byEmployee,
+      by_material:       byMaterial,
+      by_wastage_reason: byReason,
+      by_outsource_type: byOutsourceType,
     });
   } catch (err) {
     console.error("wastageReport:", err);
@@ -933,7 +962,7 @@ exports.getFlaggedIssues = async (req, res) => {
     const skip   = (parseInt(page) - 1) * parseInt(limit);
     const total  = await MaterialIssue.countDocuments(filter);
     const issues = await MaterialIssue.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit))
-      .populate("issued_to.user_id", "name role email")
+      .populate("issued_to.user_id",   "name role email")
       .populate("material.product_id", "name").lean();
 
     return resp(res, 200, true, "Flagged issues fetched.", {
@@ -984,7 +1013,7 @@ exports.deleteMaterialIssue = async (req, res) => {
 };
 
 // =============================================================================
-// 14. LIST ISSUES (simple — internal tools)
+// 14. LIST ISSUES (simple — internal tools / store manager overview)
 // GET /material?limit=50&status=issued&job_id=xxx&flagged=true
 // =============================================================================
 exports.listIssues = async (req, res) => {

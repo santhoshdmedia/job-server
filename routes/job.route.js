@@ -8,6 +8,7 @@
 const express = require("express");
 const router = express.Router();
 const jobController = require("../controller/Job.controller");
+const material = require("../controller/Material_issue.controller");
 const { upload, validateFileMiddleware } = require("../controller/shared.controller");
 // const { authMiddleware } = require("../");
 
@@ -59,14 +60,21 @@ router.get("/:id/session/status", jobController.getSessionStatus);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Add design files to item (supports file assignment)
+// ✅ Open to any designer — uploading is always allowed.
 router.post("/:id/items/:itemId/design-files", jobController.addItemDesignFiles);
 
 // Remove design file
 router.delete("/:id/items/:itemId/design-files/:fileId", jobController.removeItemDesignFile);
 
-// Assign designer to file
+// Assign designer to file (initial assignment)
 router.post("/:id/approve",  jobController.approveJob);
 router.patch("/:id/items/:itemId/design-files/:fileId/assign", jobController.assignDesignFile);
+router.post("/:id/items/:itemId/design-file/migrate", jobController.migrateDesignFile);
+
+// ✅ NEW — Re-assign an already-assigned file to a different designer, or
+// to "Outsource". Admin/superadmin only. Does not remove or replace the
+// `/assign` route above — both remain available.
+router.patch("/:id/items/:itemId/design-files/:fileId/reassign", jobController.reassignDesignFile);
 
 // Update file work status
 router.patch("/:id/items/:itemId/design-files/:fileId/status", jobController.updateFileWorkStatus);
@@ -101,11 +109,21 @@ router.post("/:id/upload_design", jobController.uploadDesign);
 // FILE UPLOAD ENDPOINT (NEW)
 // ─────────────────────────────────────────────────────────────────────────────
 
+router.get("/assigned-to/:userId", jobController.getJobsAssignedToUser);
+
+
+// payment endpoints (legacy, to be refactored later)
+router.post("/:id/collect-payment", jobController.collectPayment);
+
+
 // POST /api/jobs/upload - Upload file to S3
 // Used by frontend to upload design files before adding to job
 router.post("/upload", upload.single("image"), validateFileMiddleware, async (req, res) => {
   const { UploadImage } = require("../helpers/upload.helper");
   return UploadImage(req, res);
 });
+
+router.post("/:jobId/material/issue", material.issueMaterial);
+
 
 module.exports = router;

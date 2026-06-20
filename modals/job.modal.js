@@ -123,7 +123,7 @@ const itemDesignFileSchema = new Schema(
       name:    { type: String, default: "" },
     },
 
-    // ── NEW FIELDS for per‑file assignment ──────────────────────────────
+    // ── per‑file assignment ──────────────────────────────
     assigned_to: {
       user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
       name:    { type: String, default: "" },
@@ -182,15 +182,32 @@ const addressSchema = new Schema(
   { _id: false },
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Payment Sub-Schema
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: this used to be a single embedded object (`payment`). It is now an
+// ARRAY (`payments`) so every payment collected against a job is recorded as
+// its own history entry instead of being overwritten. `payment_amount`,
+// `balance_amount` and `next_due_date` on the parent Job document remain as
+// cached/denormalized fields for fast list/table rendering, but they are
+// always derived from this array via `recomputePayments()` — never set
+// directly from the client.
 const paymentSchema = new Schema(
   {
-    amount:        { type: Number, required: true },
+    amount:        { type: Number, required: true, min: 0.01 },
     method:        { type: String, default: "" },
     paid_at:       { type: Date, default: () => new Date() },
     notes:         { type: String, default: "" },
-    next_due_date: { type: Date },
-    balance_after: { type: Number },
+    next_due_date: { type: Date, default: null },
+    // Balance remaining on the job immediately after this payment was applied.
+    balance_after: { type: Number, default: 0 },
+
+    collected_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+    },
   },
+  { _id: true, timestamps: false },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,11 +384,16 @@ const jobSchema = new Schema(
     free_delivery:        { type: Boolean, default: false },
     total_amount:         { type: Number,  required: true },
     gst_no:               { type: String,  default: "" },
-    payment:              { type: paymentSchema, default: null },
-    payment_amount:       { type: Number,  default: 0 },
-    balance_amount:       { type: Number,  default: 0 },
 
-    next_due_date:        { type: Date,    default: null },
+    // ── Payments ───────────────────────────────────────────────────────────
+    // Full history of payments collected against this job. Use
+    // `job.addPayment({...})` to push a new entry — never push directly,
+    // so cached totals stay in sync.
+    payments:        { type: [paymentSchema], default: [] },
+    // Cached/denormalized — always derived from `payments` via recomputePayments().
+    payment_amount:  { type: Number,  default: 0 },
+    balance_amount:  { type: Number,  default: 0 },
+    next_due_date:   { type: Date,    default: null },
 
     design_charges:       { type: Number,  default: 0 },
     valid_until:          { type: Date,    required: true },
@@ -397,21 +419,16 @@ const jobSchema = new Schema(
     },
 
     // ── ✅ Site Visit back-reference ───────────────────────────────────────
-    // Populated when a job is created from a site visit ("Convert to Job Sheet").
-    // Allows bidirectional lookup: given a job, find its originating site visit.
     site_visit_id: {
       type:    Schema.Types.ObjectId,
-      ref:     "SiteVisit",   // matches the model name in site-visit.model.js
+      ref:     "SiteVisit",
       default: null,
       index:   true,
     },
     site_visit_photos: {
-      type: [Object], 
+      type: [Object],
       default: [],
     },
-
-    // Human-readable visit number stored as a string for quick display
-    // without an extra populate call (e.g. "SV-20250615-001").
     site_visit_no: {
       type:    String,
       default: "",
@@ -491,6 +508,15 @@ jobSchema.pre("save", function () {
   }
 });
 
+// Recompute payment_amount / balance_amount / next_due_date whenever the
+// payments array changes, OR whenever total_amount changes (e.g. job items
+// were edited) so the balance always reflects reality.
+jobSchema.pre("save", function () {
+  if (this.isModified("payments") || this.isModified("total_amount")) {
+    this.recomputePayments();
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Soft-Delete Query Middleware
 // ════════════════════════════════════════════════════════════════════════════
@@ -501,6 +527,74 @@ jobSchema.pre(/^find/, function () {
 
 jobSchema.query.includeDeleted = function () {
   return this.where({ deletedAt: { $ne: null } });
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Instance Methods — Payments
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Recalculate payment_amount / balance_amount / next_due_date from the
+ * `payments` array against the current `total_amount`. This is the single
+ * source of truth — call it (or just save after modifying `payments` /
+ * `total_amount`, since the pre-save hook calls it automatically) instead of
+ * setting those cached fields by hand.
+ */
+jobSchema.methods.recomputePayments = function () {
+  const totalPaid = (this.payments || []).reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+  const total     = parseFloat(this.total_amount) || 0;
+  const balance   = parseFloat((total - totalPaid).toFixed(2));
+
+  this.payment_amount = parseFloat(totalPaid.toFixed(2));
+  this.balance_amount = balance;
+
+  if (balance <= 0) {
+    // Fully paid (or overpaid/advance) — nothing left to chase.
+    this.next_due_date = null;
+  } else if (this.payments && this.payments.length) {
+    // Use whatever due date was set on the most recent payment.
+    const last = this.payments[this.payments.length - 1];
+    this.next_due_date = last.next_due_date || null;
+  }
+};
+
+/**
+ * Record a new payment against this job. Validates the amount against the
+ * current balance, pushes a history entry with `balance_after` snapshot, and
+ * recomputes the cached totals. Caller is still responsible for calling
+ * `job.save()`.
+ */
+jobSchema.methods.addPayment = function ({ amount, method = "", notes = "", next_due_date = null, paid_at = null, collected_by = {} }) {
+  const amt = parseFloat(amount);
+  if (!amt || amt <= 0) {
+    throw new Error("Payment amount must be greater than zero.");
+  }
+
+  const priorPaid = (this.payments || []).reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+  const total     = parseFloat(this.total_amount) || 0;
+  const priorBalance = parseFloat((total - priorPaid).toFixed(2));
+
+  if (amt > priorBalance + 0.01) {
+    throw new Error(`Payment amount (₹${amt.toFixed(2)}) exceeds the outstanding balance (₹${priorBalance.toFixed(2)}).`);
+  }
+
+  const balanceAfter = parseFloat((priorBalance - amt).toFixed(2));
+
+  this.payments.push({
+    amount:        amt,
+    method,
+    notes,
+    paid_at:       paid_at ? new Date(paid_at) : new Date(),
+    next_due_date: balanceAfter > 0 && next_due_date ? new Date(next_due_date) : null,
+    balance_after: balanceAfter,
+    collected_by: {
+      user_id: collected_by.user_id || null,
+      name:    collected_by.name    || "",
+    },
+  });
+
+  this.recomputePayments();
+  return this;
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -625,7 +719,6 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
         name:    uploadedBy.name    || "",
       },
     };
-    // Accept per‑file assignment
     if (f.assigned_to) {
       fileData.assigned_to = {
         user_id: f.assigned_to.user_id || null,
@@ -639,7 +732,6 @@ jobSchema.methods.addItemDesignFiles = function (itemId, files, uploadedBy = {})
     item.design_files.push(fileData);
   }
 
-  // Update item design status if it was pending or rejected
   if (item.design_status === "pending" || item.design_status === "rejected") {
     item.design_status = "uploaded";
   }
@@ -742,7 +834,7 @@ jobSchema.statics.getWorkflowHistory = function (jobId) {
       "job_no job_status current_stage workflow_stages " +
       "design_file design_status design_duration_seconds design_duration_display " +
       "qc_images qc_status qc_notes qc_duration_display cart_items " +
-      "site_visit_id site_visit_no site_visit_photos",  
+      "site_visit_id site_visit_no site_visit_photos",
     )
     .populate("workflow_stages.handled_by.user_id", "name role email")
     .populate("workflow_stages.assigned_by.user_id", "name role")

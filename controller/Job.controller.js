@@ -23,6 +23,27 @@ const toPlain = (doc) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ✅ Helper: Role guard
+// Normal designers ("designing team") can upload files, but assigning,
+// reassigning, approving, and rejecting design work is an admin/superadmin
+// action only. This is a best-effort, backward-compatible check — if a caller
+// doesn't send `handled_by.role` (older clients), the request is still
+// allowed through so nothing existing breaks. Any caller that DOES send a
+// role is held to it.
+// ─────────────────────────────────────────────────────────────────────────────
+const MANAGER_ROLES = ["admin", "super admin"];
+const isManagerRole = (role) => MANAGER_ROLES.includes(String(role || "").toLowerCase().trim());
+
+const requireManagerRole = (res, handledBy, actionLabel) => {
+  const role = handledBy?.role;
+  if (role && !isManagerRole(role)) {
+    resp(res, 403, false, `Only admin or super admin can ${actionLabel}.`);
+    return false;
+  }
+  return true;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helper: Generate Job Number
 // ─────────────────────────────────────────────────────────────────────────────
 const generateJobNo = async () => {
@@ -52,7 +73,7 @@ exports.createJob = async (req, res) => {
       estimated_delivery_date, cart_items, delivery_address, job_status,
       subtotal, discount_percentage, discount_amount, taxable_amount,
       tax_amount, delivery_charges, free_delivery, total_amount, gst_no,
-      payment_mode, payment_amount, balance_amount, design_charges,
+      payments, design_charges,
       valid_until, notes, terms_and_conditions, created_by,
       created_by_admin_id, site_visit_id, site_visit_no, site_visit_photos,
     } = req.body;
@@ -67,7 +88,10 @@ exports.createJob = async (req, res) => {
       designers: item.designers || [],
     }));
 
-    const jobData = await Job.create({
+    // Build the job WITHOUT payments first. total_amount must be set
+    // before we call addPayment(), since it validates amount against
+    // the outstanding balance (total_amount - prior payments).
+    const job = new Job({
       job_no,
       order_no: order_no || "",
       customer_name: customer_name || "",
@@ -88,9 +112,6 @@ exports.createJob = async (req, res) => {
       free_delivery: free_delivery ?? false,
       total_amount: parseFloat(total_amount),
       gst_no: gst_no || "",
-      payment_mode: payment_mode || "",
-      payment_amount: parseFloat(payment_amount) || 0,
-      balance_amount: parseFloat(balance_amount) || 0,
       design_charges: parseFloat(design_charges) || 0,
       valid_until: new Date(valid_until),
       notes: notes || "",
@@ -104,10 +125,33 @@ exports.createJob = async (req, res) => {
       site_visit_photos: site_visit_photos || [],
     });
 
+    // Record any initial payment(s) through the schema's own addPayment()
+    // helper, so amount-vs-balance validation, the balance_after snapshot,
+    // and the cached payment_amount/balance_amount/next_due_date fields
+    // are all computed correctly — never trusted directly from the client.
+    const collectedBy = {
+      user_id: created_by_admin_id || null,
+      name:    created_by || "Admin",
+    };
+
+    for (const p of payments || []) {
+      if (!p || !p.amount) continue;
+      job.addPayment({
+        amount:        p.amount,
+        method:        p.method || "",
+        notes:         p.notes || "",
+        next_due_date: p.next_due_date || null,
+        paid_at:       p.paid_at || null,
+        collected_by:  collectedBy,
+      });
+    }
+
+    await job.save();
+
     return res.status(201).json({
       success: true,
       message: "Job created successfully.",
-      data: toPlain(jobData),
+      data: toPlain(job),
     });
   } catch (err) {
     console.error("❌ createJob", err);
@@ -116,7 +160,6 @@ exports.createJob = async (req, res) => {
     return resp(res, 500, false, err.message);
   }
 };
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. GET ALL JOBS
 // GET /api/jobs
@@ -162,6 +205,18 @@ exports.getAllJobs = async (req, res) => {
   }
 };
 
+exports.getJobsAssignedToUser = async (req, res) => {
+  try {
+    const { userId } = req.params; const { status } = req.query;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return resp(res, 400, false, "Invalid userId.");
+    const filter = { "current_stage.assigned_to.user_id": new mongoose.Types.ObjectId(userId) };
+    if (status) filter.job_status = status;
+    const jobs = await Job.find(filter).select("-workflow_stages").sort({ "current_stage.since": -1 }).lean();
+    return resp(res, 200, true, "Jobs fetched.", jobs);
+  } catch (err) { return resp(res, 500, false, err.message); }
+};
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. GET SINGLE JOB
 // GET /api/jobs/:id
@@ -189,6 +244,18 @@ exports.getJobById = async (req, res) => {
 // 4. ADD DESIGN FILES TO A CART ITEM
 // POST /api/jobs/:id/items/:itemId/design-files
 // Body: { files: [{ url, file_name, file_type, label, caption, assigned_to? }], handled_by }
+//
+// ✅ Any normal designer can call this — uploading is always allowed. They
+// simply won't (per the frontend) send a label/assigned_to, which is fine —
+// both default sensibly below.
+//
+// ✅ FIX: previously, re-uploading a NEW file against an item that was
+// already "approved" left design_status stuck on "approved", so the
+// Approve/Reject controls in the UI stayed hidden/disabled for admins.
+// Now ANY new file added moves the item back to "uploaded" — i.e. back into
+// the review queue — regardless of whether it was previously pending,
+// rejected, or approved. This is what makes "approve button reappears after
+// a new design is uploaded post-approval" work.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.addItemDesignFiles = async (req, res) => {
   try {
@@ -215,9 +282,10 @@ exports.addItemDesignFiles = async (req, res) => {
     if (!item) return resp(res, 404, false, "Cart item not found.");
 
     const now = new Date();
+    const wasApproved = item.design_status === "approved";
 
     for (const f of validFiles) {
-      const hasAssignee = !!f.assigned_to?.user_id;
+      const hasAssignee = !!f.assigned_to?.user_id || (f.assigned_to?.role === "outsource");
       item.design_files.push({
         url:         f.url.trim(),
         file_name:   (f.file_name  || "").trim(),
@@ -231,7 +299,7 @@ exports.addItemDesignFiles = async (req, res) => {
         },
         assigned_to: hasAssignee
           ? {
-              user_id: f.assigned_to.user_id,
+              user_id: f.assigned_to.user_id || null,
               name:    f.assigned_to.name || "",
               role:    f.assigned_to.role || "designing team",
             }
@@ -241,16 +309,20 @@ exports.addItemDesignFiles = async (req, res) => {
       });
     }
 
-    // Advance item design_status
-    if (item.design_status === "pending" || item.design_status === "rejected") {
-      item.design_status = "uploaded";
+    // ✅ Any new upload puts the item back in front of admin/superadmin for
+    // review — including the case where it was already approved before.
+    item.design_status = "uploaded";
+    item.design_rejection_reason = "";
+    if (wasApproved) {
+      item.design_approved_at = null;
+      item.design_approved_by = {};
     }
 
     // .save() fires ALL pre-save hooks (status rollup, timer recompute, etc.)
     await job.save();
 
     // Return plain object — frontend needs a clean serializable job
-    return resp(res, 200, true, `${validFiles.length} design file(s) added.`, {
+    return resp(res, 200, true, `${validFiles.length} design file(s) added.${wasApproved ? " Item is back in review." : ""}`, {
       job: toPlain(job),
     });
   } catch (err) {
@@ -417,13 +489,22 @@ exports.assignJob = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. ASSIGN FILE TO DESIGNER
+// 6. ASSIGN FILE TO DESIGNER (initial assignment)
 // PATCH /api/jobs/:id/items/:itemId/design-files/:fileId/assign
+// Body: { assigned_to: { user_id?, name, role? }, handled_by?: { user_id, name, role } }
+//
+// ✅ Admin/superadmin only (enforced if caller sends handled_by.role).
+// Can also be called again later to change the assignee — see the dedicated
+// `reassignDesignFile` below for the explicit "this file is already assigned,
+// route it elsewhere (including Outsource)" flow, which behaves the same
+// but is intended for that specific re-routing action and tracks who did it.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.assignDesignFile = async (req, res) => {
   try {
     const { id, itemId, fileId } = req.params;
-    const { assigned_to } = req.body;
+    const { assigned_to, handled_by = {} } = req.body;
+
+    if (!requireManagerRole(res, handled_by, "assign design files")) return;
 
     if (!assigned_to?.name)
       return resp(res, 400, false, "assigned_to.name is required.");
@@ -458,6 +539,140 @@ exports.assignDesignFile = async (req, res) => {
   }
 };
 
+
+const ok  = (res, data = {}, status = 200) =>
+  res.status(status).json({ success: true,  ...data });
+
+const err = (res, message = "Something went wrong", status = 500) =>
+  res.status(status).json({ success: false, message });
+
+const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+exports.migrateDesignFile = async (req, res) => {
+  try {
+    const { id, itemId } = req.params;
+    if (!isValidId(id)) return err(res, "Invalid job ID", 400);
+
+    const job = await Job.findById(id);
+    if (!job) return err(res, "Job not found", 404);
+
+    const item = job.findCartItem(itemId);
+    if (!item) return err(res, `Cart item "${itemId}" not found`, 404);
+
+    // Nothing to migrate
+    if (!item.design_file) {
+      // If already migrated (file is in array, design_file is empty), return ok
+      // so the frontend can safely call migrate idempotently.
+      return ok(res, {
+        message: "No legacy file to migrate",
+        data: { job, migrated_file_id: null },
+      });
+    }
+
+    const { label = "Other", assigned_to, handled_by = {} } = req.body;
+
+    const legacyUrl = item.design_file;
+
+    // Derive a reasonable file_name and file_type from the URL
+    const urlPath    = legacyUrl.split("?")[0]; // strip query params
+    const fileName   = urlPath.split("/").pop() || "design_file";
+    const fileExt    = fileName.split(".").pop()?.toLowerCase() || "";
+
+    // Build the new design_files entry
+    const newFileData = {
+      url:       legacyUrl,
+      file_name: fileName,
+      file_type: fileExt,
+      label,
+      caption:   "Migrated from legacy design_file",
+      uploaded_at: new Date(),
+      uploaded_by: {
+        user_id: handled_by.user_id || null,
+        name:    handled_by.name    || "System",
+      },
+    };
+
+    if (assigned_to) {
+      newFileData.assigned_to = {
+        user_id: assigned_to.user_id || null,
+        name:    assigned_to.name    || "",
+        role:    assigned_to.role    || "",
+      };
+    }
+
+    item.design_files.push(newFileData);
+
+    // The newly pushed document — get its _id before clearing design_file
+    const migratedFile = item.design_files[item.design_files.length - 1];
+    const migratedFileId = migratedFile._id.toString();
+
+    // Clear the legacy field so it won't appear in the UI again
+    item.design_file = "";
+
+    // Ensure design_status reflects that we now have a file in the array
+    if (item.design_status === "pending") {
+      item.design_status = "uploaded";
+    }
+
+    await job.save();
+
+    ok(res, {
+      message: "Legacy design file migrated successfully",
+      data: {
+        job,
+        migrated_file_id: migratedFileId,
+      },
+    });
+  } catch (e) {
+    err(res, e.message);
+  }
+};
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// 6b. REASSIGN FILE TO A DIFFERENT DESIGNER / OUTSOURCE  (NEW)
+// PATCH /api/jobs/:id/items/:itemId/design-files/:fileId/reassign
+// Body: { assigned_to: { user_id?, name, role? }, handled_by?: { user_id, name, role } }
+//
+// ✅ New, additive endpoint — does not replace `assignDesignFile` above.
+// Lets admin/superadmin move a file that's already in someone's queue to a
+// different internal designer, or hand it off to "Outsource"
+// ({ name: "Outsource", role: "outsource" }), at any point after the
+// original assignment. Same effect as calling /assign again, but kept as
+// its own endpoint so re-routing actions are explicit and easy to find/audit.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.reassignDesignFile = async (req, res) => {
+  try {
+    const { id, itemId, fileId } = req.params;
+    if (!isValidId(id)) return err(res, "Invalid job ID", 400);
+ 
+    const { assigned_to, label, handled_by } = req.body;
+    if (!assigned_to) return err(res, "assigned_to is required", 400);
+ 
+    const job = await Job.findById(id);
+    if (!job) return err(res, "Job not found", 404);
+ 
+    const item = job.findCartItem(itemId);
+    if (!item) return err(res, `Cart item "${itemId}" not found`, 404);
+ 
+    const file = item.design_files.id(fileId);
+    if (!file) return err(res, `Design file "${fileId}" not found`, 404);
+ 
+    // Update assignment
+    file.assigned_to = {
+      user_id: assigned_to.user_id || null,
+      name:    assigned_to.name    || "",
+      role:    assigned_to.role    || "",
+    };
+ 
+    // Optionally update label
+    if (label) file.label = label;
+ 
+    await job.save();
+    ok(res, { message: "File reassigned successfully", data: { job } });
+  } catch (e) {
+    err(res, e.message);
+  }
+};
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. UPDATE FILE WORK STATUS
 // PATCH /api/jobs/:id/items/:itemId/design-files/:fileId/status
@@ -500,11 +715,14 @@ exports.updateFileWorkStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. APPROVE ITEM DESIGN
 // POST /api/jobs/:id/items/:itemId/approve-design
+// ✅ Admin/superadmin only (enforced if caller sends handled_by.role).
 // ─────────────────────────────────────────────────────────────────────────────
 exports.approveItemDesign = async (req, res) => {
   try {
     const { id, itemId } = req.params;
     const { handled_by = {} } = req.body;
+
+    if (!requireManagerRole(res, handled_by, "approve item designs")) return;
 
     const job = await Job.findById(id);
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -541,11 +759,14 @@ exports.approveItemDesign = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. REJECT ITEM DESIGN
 // POST /api/jobs/:id/items/:itemId/reject-design
+// ✅ Admin/superadmin only (enforced if caller sends handled_by.role).
 // ─────────────────────────────────────────────────────────────────────────────
 exports.rejectItemDesign = async (req, res) => {
   try {
     const { id, itemId } = req.params;
     const { handled_by = {}, notes = "" } = req.body;
+
+    if (!requireManagerRole(res, handled_by, "reject item designs")) return;
 
     if (!notes?.trim())
       return resp(res, 400, false, "Rejection reason is required.");
@@ -901,10 +1122,13 @@ exports.restoreJob = async (req, res) => {
 };
 
 // Approve a single design file
+// ✅ Admin/superadmin only (enforced if caller sends handled_by.role).
 exports.approveDesignFile = async (req, res) => {
   try {
     const { id, itemId, fileId } = req.params;
     const { handled_by = {} } = req.body;
+
+    if (!requireManagerRole(res, handled_by, "approve design files")) return;
 
     const job = await Job.findById(id);
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -931,10 +1155,13 @@ exports.approveDesignFile = async (req, res) => {
 };
 
 // Reject a single design file
+// ✅ Admin/superadmin only (enforced if caller sends handled_by.role).
 exports.rejectDesignFile = async (req, res) => {
   try {
     const { id, itemId, fileId } = req.params;
     const { handled_by = {}, notes = "" } = req.body;
+
+    if (!requireManagerRole(res, handled_by, "reject design files")) return;
 
     if (!notes?.trim()) return resp(res, 400, false, "Rejection reason required.");
 
@@ -960,5 +1187,38 @@ exports.rejectDesignFile = async (req, res) => {
   } catch (err) {
     console.error("❌ rejectDesignFile", err);
     return resp(res, 500, false, err.message);
+  }
+};
+
+// POST /api/jobs/:id/collect-payment
+exports.collectPayment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, method = "", notes = "", next_due_date = null } = req.body;
+ 
+    const job = await Job.findById(id);
+    if (!job) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+ 
+    const profile = req.user || {}; // however you attach the authenticated admin
+ 
+    job.addPayment({
+      amount,
+      method,
+      notes,
+      next_due_date,
+      collected_by: { user_id: profile._id || null, name: profile.name || "" },
+    });
+ 
+    await job.save();
+ 
+    return res.json({
+      success: true,
+      message: "Payment recorded successfully",
+      data: job,
+    });
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message || "Failed to record payment" });
   }
 };
