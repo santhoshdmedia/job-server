@@ -52,6 +52,7 @@ const ROLE_DEFAULT_PAGES = {
   "quality check":    ["orders", "settings"],
   "packing team":     ["orders"],
   "delivery team":    ["dashboard", "orders", "settings"],
+  "admin":null
 };
 
 // ─────────────────────────────────────────────

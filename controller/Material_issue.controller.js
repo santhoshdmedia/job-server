@@ -1,18 +1,12 @@
 // ==================== MATERIAL ISSUE CONTROLLER ====================
 // Handles the full lifecycle:
-//   1. Calculate required material (preview)
-//   2. Issue material — three calc modes: server | sqft | dimensions
-//   3. Record production completion
-//   4. Record material return + wastage
-//   5. Manager review
-//   6. Reporting
-//
-// KEY CHANGES (v3):
-//  • issueMaterial handles calc_mode "dimensions" (printing + media dims)
-//  • issueForDesignFile — issue material tied to a specific design file _id
-//  • Stock is NOT decremented for outsource issues (calc_mode "outsource")
-//  • issued_to is OPTIONAL for in-house (falls back to design file's assigned_to)
-//  • outsource issued_to.user_id is always null (vendor stored in outsource_vendor)
+//   1.  Calculate required material (preview)
+//   2.  Issue material — four calc modes: server | sqft | dimensions | outsource
+//   3.  Record production completion
+//   4.  Record material return + wastage
+//   5.  Manager review
+//   6.  Pickup assignment — assign, update status, get by person
+//   7.  Reporting
 
 const mongoose      = require("mongoose");
 const MaterialIssue = require("../modals/Material_issue.model");
@@ -21,7 +15,7 @@ const Product       = require("../modals/product.models");
 const AdminUsers    = require("../modals/adminusers.modals");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 const resp = (res, status, success, message, data = null) => {
   const payload = { success, message };
@@ -43,9 +37,7 @@ const decrementStock = async (productId, qty, actorName, note) => {
   if (!productId) return;
   await Product.findByIdAndUpdate(productId, {
     $inc:  { stock_count: -qty },
-    $push: {
-      stock_log: { action: "decrement", qty, actor_name: actorName, note, logged_at: new Date() },
-    },
+    $push: { stock_log: { action: "decrement", qty, actor_name: actorName, note, logged_at: new Date() } },
   });
 };
 
@@ -53,9 +45,7 @@ const incrementStock = async (productId, qty, actorName, note) => {
   if (!productId) return;
   await Product.findByIdAndUpdate(productId, {
     $inc:  { stock_count: qty },
-    $push: {
-      stock_log: { action: "increment", qty, actor_name: actorName, note, logged_at: new Date() },
-    },
+    $push: { stock_log: { action: "increment", qty, actor_name: actorName, note, logged_at: new Date() } },
   });
 };
 
@@ -64,9 +54,9 @@ const buildReturnSummary = (issue) => {
   const calc = issue.calculation;
   if (!r) return null;
   return {
-    efficiency_pct:                  parseFloat(((r.actual_used_qty / issue.issued_qty) * 100).toFixed(2)),
-    over_issued_sqft:                parseFloat((issue.issued_qty - (calc.required_sqft || 0)).toFixed(4)),
-    actual_vs_expected_wastage:      parseFloat((r.actual_wastage_qty - r.expected_wastage_qty).toFixed(4)),
+    efficiency_pct:             parseFloat(((r.actual_used_qty / issue.issued_qty) * 100).toFixed(2)),
+    over_issued_sqft:           parseFloat((issue.issued_qty - (calc.required_sqft || 0)).toFixed(4)),
+    actual_vs_expected_wastage: parseFloat((r.actual_wastage_qty - r.expected_wastage_qty).toFixed(4)),
     verdict:
       r.performance_rating === "good"        ? "Great — material used efficiently."
       : r.performance_rating === "acceptable" ? "Within acceptable range."
@@ -101,15 +91,14 @@ const computeJobTotals = (issues) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal: build the calculation snapshot from request body.
-// Returns { calc, dimensionRecord, printDim, mediaDim, wastageSq, effectiveMode }
+// Internal: build the calculation snapshot from request body
 // ─────────────────────────────────────────────────────────────────────────────
 const buildCalculation = ({
   calc_mode, sq_ft, dimensions, printing_dimensions, media_dimensions,
   margin_top_in, margin_bottom_in, wastage_buffer_pct, outsource_type,
 }) => {
-  const buf        = parseFloat(wastage_buffer_pct) || 0;
-  const isOut      = outsource_type && outsource_type !== "none";
+  const buf           = parseFloat(wastage_buffer_pct) || 0;
+  const isOut         = outsource_type && outsource_type !== "none";
   const effectiveMode = isOut ? "outsource" : (calc_mode || "server");
 
   let calc;
@@ -127,15 +116,12 @@ const buildCalculation = ({
     const mSq  = parseFloat((mFtW * mFtH).toFixed(4));
 
     calc = {
-      print_sqft:         pSq,
-      media_sqft:         mSq,
-      wastage_sqft:       parseFloat((mSq - pSq).toFixed(4)),
-      wastage_buffer_pct: 0,
-      buffer_sqft:        0,
-      required_sqft:      mSq,
+      print_sqft: pSq, media_sqft: mSq,
+      wastage_sqft: parseFloat((mSq - pSq).toFixed(4)),
+      wastage_buffer_pct: 0, buffer_sqft: 0, required_sqft: mSq,
     };
-    if (printing_dimensions) printDim = { width: printing_dimensions.width, height: printing_dimensions.height, unit: printing_dimensions.unit || printing_dimensions.width_unit || "ft", sqft: pSq };
-    if (media_dimensions)    mediaDim = { width: media_dimensions.width,    height: media_dimensions.height,    unit: media_dimensions.unit    || media_dimensions.width_unit    || "ft", sqft: mSq };
+    if (printing_dimensions) printDim = { width: printing_dimensions.width, height: printing_dimensions.height, unit: printing_dimensions.unit || "ft", sqft: pSq };
+    if (media_dimensions)    mediaDim = { width: media_dimensions.width,    height: media_dimensions.height,    unit: media_dimensions.unit    || "ft", sqft: mSq };
     wastageSq = parseFloat((mSq - pSq).toFixed(4));
 
   } else if (effectiveMode === "dimensions") {
@@ -157,17 +143,10 @@ const buildCalculation = ({
     mediaDim   = { width: md.width, height: md.height, unit: mUnit, sqft: mSq };
     wastageSq  = Math.max(0, waste);
     calc = {
-      print_sqft:           pSq,
-      media_sqft:           mSq,
-      wastage_sqft:         wastageSq,
-      wastage_buffer_pct:   buf,
-      buffer_sqft:          bufSq,
-      required_sqft:        req,
-      job_sqft:             pSq,
-      gross_sqft:           mSq,
-      margin_sqft:          0,
-      margin_top_inches:    0,
-      margin_bottom_inches: 0,
+      print_sqft: pSq, media_sqft: mSq, wastage_sqft: wastageSq,
+      wastage_buffer_pct: buf, buffer_sqft: bufSq, required_sqft: req,
+      job_sqft: pSq, gross_sqft: mSq, margin_sqft: 0,
+      margin_top_inches: 0, margin_bottom_inches: 0,
     };
     dimensionRecord = { width: md.width || 0, height: md.height || 0, unit: mUnit };
 
@@ -218,8 +197,8 @@ const buildCalculation = ({
 exports.calculateMaterial = (req, res) => {
   try {
     const { width_ft, height_ft, margin_top_in = 4, margin_bottom_in = 3, wastage_buffer_pct = 20 } = req.body;
-    if (!width_ft || !height_ft)          return resp(res, 400, false, "width_ft and height_ft are required.");
-    if (width_ft <= 0 || height_ft <= 0)  return resp(res, 400, false, "Dimensions must be greater than 0.");
+    if (!width_ft || !height_ft)         return resp(res, 400, false, "width_ft and height_ft are required.");
+    if (width_ft <= 0 || height_ft <= 0) return resp(res, 400, false, "Dimensions must be greater than 0.");
 
     const calc = MaterialIssue.calculateRequired({ width_ft, height_ft, margin_top_in, margin_bottom_in, wastage_buffer_pct });
 
@@ -244,18 +223,6 @@ exports.calculateMaterial = (req, res) => {
 // =============================================================================
 // 2. ISSUE MATERIAL  (store manager → employee / outsource vendor)
 // POST /api/jobs/:jobId/material/issue
-//
-// Supports three calc modes via body.calc_mode:
-//   "server"     — body.dimensions { width, height } → server calc
-//   "sqft"       — body.sq_ft (flat sqft from cart)
-//   "dimensions" — body.printing_dimensions + body.media_dimensions
-//   "outsource"  — outsourced; no stock deduction; vendor stored in outsource_vendor
-//
-// KEY NOTES:
-//   • For in-house:  issued_to is used if provided; if not, falls back to
-//     the assigned_to of the referenced design file.
-//   • For outsource: issued_to.name = vendor name, issued_to.user_id = null.
-//     No slip is generated by the backend; frontend skips slip generation too.
 // =============================================================================
 exports.issueMaterial = async (req, res) => {
   try {
@@ -287,17 +254,13 @@ exports.issueMaterial = async (req, res) => {
     // ── Validation ───────────────────────────────────────────────────────────
     if (!isOutsourced && !material?.product_id)
       return resp(res, 400, false, "material.product_id is required for in-house issues.");
-
     if (issued_qty === undefined || issued_qty === null)
       return resp(res, 400, false, "issued_qty is required (use 0 for outsource with no qty).");
-
     if (!issued_by?.user_id || !issued_by?.name)
       return resp(res, 400, false, "issued_by.user_id and issued_by.name are required.");
-
     if (isOutsourced && !outsource_vendor?.trim())
       return resp(res, 400, false, "outsource_vendor is required for outsourced work.");
 
-    // Dimension presence checks (only for non-outsource)
     if (!isOutsourced) {
       if (calc_mode === "sqft" && (!parseFloat(sq_ft) || parseFloat(sq_ft) <= 0))
         return resp(res, 400, false, "sq_ft must be > 0 when calc_mode is 'sqft'.");
@@ -307,15 +270,15 @@ exports.issueMaterial = async (req, res) => {
         return resp(res, 400, false, "printing_dimensions and media_dimensions required when calc_mode is 'dimensions'.");
     }
 
-    // ── Fetch related documents ──────────────────────────────────────────────
+    // ── Fetch job ────────────────────────────────────────────────────────────
     const job = await Job.findById(jobId).lean();
     if (!job) return resp(res, 404, false, "Job not found.");
 
+    // ── Stock check ──────────────────────────────────────────────────────────
     let product = null;
     if (!isOutsourced && material?.product_id) {
       product = await Product.findById(material.product_id).lean();
       if (!product) return resp(res, 404, false, "Material product not found.");
-
       const available = product.stock_count || 0;
       const qtyNeeded = parseFloat(issued_qty) || 0;
       if (available < qtyNeeded)
@@ -324,29 +287,15 @@ exports.issueMaterial = async (req, res) => {
         );
     }
 
-    // ── Resolve issued_to ─────────────────────────────────────────────────────
-    // For outsource: vendor name goes into issued_to.name, user_id = null
-    // For in-house:  use provided issued_to if present, else fall back to
-    //                the design file's assigned_to (assignment was done upstream)
+    // ── Resolve issued_to ────────────────────────────────────────────────────
     let resolvedIssuedTo = { user_id: null, name: "", role: "" };
-
     if (isOutsourced) {
-      resolvedIssuedTo = {
-        user_id: null,
-        name:    outsource_vendor.trim(),
-        role:    "outsource",
-      };
+      resolvedIssuedTo = { user_id: null, name: outsource_vendor.trim(), role: "outsource" };
     } else {
-      // Try provided issued_to first
       if (issued_to?.user_id) {
-        resolvedIssuedTo = {
-          user_id: issued_to.user_id,
-          name:    issued_to.name || "",
-          role:    issued_to.role || "",
-        };
+        resolvedIssuedTo = { user_id: issued_to.user_id, name: issued_to.name || "", role: issued_to.role || "" };
       } else if (design_file_id) {
-        // Fall back to design file's assigned_to
-        const cartItem = job.cart_items?.[cart_item_index];
+        const cartItem   = job.cart_items?.[cart_item_index];
         const designFile = cartItem?.design_files?.find(f => f._id?.toString() === design_file_id);
         if (designFile?.assigned_to?.user_id) {
           resolvedIssuedTo = {
@@ -356,30 +305,25 @@ exports.issueMaterial = async (req, res) => {
           };
         }
       }
-      // Validate employee exists if we have a user_id
       if (resolvedIssuedTo.user_id) {
         const employee = await AdminUsers.findById(resolvedIssuedTo.user_id).lean();
-        if (!employee) {
-          // Non-fatal: keep the name from the payload but log
-          console.warn(`issueMaterial: employee ${resolvedIssuedTo.user_id} not found, using name from payload`);
-        }
+        if (!employee) console.warn(`issueMaterial: employee ${resolvedIssuedTo.user_id} not found`);
       }
     }
 
-    // ── Build calculation snapshot ───────────────────────────────────────────
+    // ── Build calculation ────────────────────────────────────────────────────
     const { calc, dimensionRecord, printDim, mediaDim, wastageSq, effectiveMode } = buildCalculation({
       calc_mode, sq_ft, dimensions, printing_dimensions, media_dimensions,
       margin_top_in, margin_bottom_in, wastage_buffer_pct, outsource_type,
     });
 
-    // ── Generate issue number ────────────────────────────────────────────────
+    // ── Create record ────────────────────────────────────────────────────────
     const issue_no       = await MaterialIssue.generateIssueNo();
     const cartItem       = job.cart_items?.[cart_item_index];
     const cart_item_name = cartItem?.product_name || cartItem?.name || "";
-    const resolvedOutsourceVendor = isOutsourced ? outsource_vendor.trim() : "";
-    const qty = parseFloat(issued_qty) || 0;
+    const qty            = parseFloat(issued_qty) || 0;
+    const resolvedVendor = isOutsourced ? outsource_vendor.trim() : "";
 
-    // ── Create issue record ──────────────────────────────────────────────────
     const issue = await MaterialIssue.create({
       issue_no,
       job_id:          jobId,
@@ -412,63 +356,45 @@ exports.issueMaterial = async (req, res) => {
       calculation:         calc,
       issue_notes,
       outsource_type,
-      outsource_vendor: resolvedOutsourceVendor,
-      status: "issued",
+      outsource_vendor:    resolvedVendor,
+      pickup_assignment:   null,
+      status:              "issued",
     });
 
-    // ── Write issue reference back to Job cart_item ──────────────────────────
+    // ── Write back to Job cart_item ──────────────────────────────────────────
     const cartUpdateFields = {
       [`cart_items.${cart_item_index}.outsource_type`]:    outsource_type,
-      [`cart_items.${cart_item_index}.outsource_vendor`]:  resolvedOutsourceVendor,
+      [`cart_items.${cart_item_index}.outsource_vendor`]:  resolvedVendor,
       [`cart_items.${cart_item_index}.material_issue_id`]: issue._id,
       [`cart_items.${cart_item_index}.issued_qty`]:        qty,
-      [`cart_items.${cart_item_index}.issued_by`]: {
-        user_id: issued_by.user_id,
-        name:    issued_by.name,
-        role:    issued_by.role || "",
-      },
-      [`cart_items.${cart_item_index}.issued_to`]: resolvedIssuedTo,
+      [`cart_items.${cart_item_index}.issued_by`]:         { user_id: issued_by.user_id, name: issued_by.name, role: issued_by.role || "" },
+      [`cart_items.${cart_item_index}.issued_to`]:         resolvedIssuedTo,
     };
-
-    // If tied to a specific design file, stamp material_issue_id on that file too
     if (design_file_id) {
-      cartUpdateFields[
-        `cart_items.${cart_item_index}.design_files.$[file].material_issue_id`
-      ] = issue._id;
+      cartUpdateFields[`cart_items.${cart_item_index}.design_files.$[file].material_issue_id`] = issue._id;
     }
-
     await Job.findByIdAndUpdate(
       jobId,
       { $set: cartUpdateFields },
-      design_file_id
-        ? { arrayFilters: [{ "file._id": new mongoose.Types.ObjectId(design_file_id) }] }
-        : {}
+      design_file_id ? { arrayFilters: [{ "file._id": new mongoose.Types.ObjectId(design_file_id) }] } : {}
     );
 
     // ── Decrement stock (SKIP for outsource) ─────────────────────────────────
     if (!isOutsourced && material?.product_id && qty > 0) {
-      await decrementStock(
-        material.product_id, qty, issued_by.name,
-        `Issued for job ${job.job_no} (Issue: ${issue_no})`
-      );
+      await decrementStock(material.product_id, qty, issued_by.name,
+        `Issued for job ${job.job_no} (Issue: ${issue_no})`);
     }
 
     return resp(res, 201, true, `Material issued. Issue No: ${issue_no}`, {
-      issue_no,
-      issue_id:            issue._id,
-      job_no:              job.job_no,
-      material_name:       issue.material.product_name,
-      issued_qty:          qty,
-      suggested_qty:       calc.required_sqft,
-      issued_to:           resolvedIssuedTo.name,
-      outsource_type,
-      outsource_vendor:    resolvedOutsourceVendor,
-      calc_mode:           effectiveMode,
-      printing_dimensions: printDim,
-      media_dimensions:    mediaDim,
-      wastage_sqft:        wastageSq,
-      calculation:         calc,
-      stock_remaining:     product ? parseFloat((product.stock_count - qty).toFixed(4)) : null,
+      issue_no, issue_id: issue._id, job_no: job.job_no,
+      material_name: issue.material.product_name,
+      issued_qty: qty, suggested_qty: calc.required_sqft,
+      issued_to: resolvedIssuedTo.name,
+      outsource_type, outsource_vendor: resolvedVendor,
+      calc_mode: effectiveMode,
+      printing_dimensions: printDim, media_dimensions: mediaDim,
+      wastage_sqft: wastageSq, calculation: calc,
+      stock_remaining: product ? parseFloat((product.stock_count - qty).toFixed(4)) : null,
     });
   } catch (err) {
     console.error("issueMaterial:", err);
@@ -482,7 +408,6 @@ exports.issueMaterial = async (req, res) => {
 // =============================================================================
 exports.issueForDesignFile = async (req, res) => {
   const { jobId, itemId, fileId } = req.params;
-
   const job = await Job.findById(jobId).lean();
   if (!job) return resp(res, 404, false, "Job not found.");
 
@@ -497,7 +422,6 @@ exports.issueForDesignFile = async (req, res) => {
   req.body.cart_item_id      = itemId;
   req.body.design_file_id    = fileId;
   req.body.design_file_label = file.label || "";
-
   return exports.issueMaterial(req, res);
 };
 
@@ -515,10 +439,8 @@ exports.recordProductionCompletion = async (req, res) => {
     } = req.body;
 
     if (!machine_name?.trim()) return resp(res, 400, false, "machine_name is required.");
-
     const issue = await MaterialIssue.findById(issueId);
     if (!issue) return resp(res, 404, false, "Material issue record not found.");
-
     if (!Array.isArray(ink_used)) return resp(res, 400, false, "ink_used must be an array.");
     for (const ink of ink_used) {
       if (!ink.color?.trim()) return resp(res, 400, false, "Each ink entry must have a color.");
@@ -529,10 +451,8 @@ exports.recordProductionCompletion = async (req, res) => {
     await issue.save();
 
     return resp(res, 200, true, "Production metadata saved.", {
-      issue_no:                    issue.issue_no,
-      machine_name:                issue.machine_name,
-      ink_used:                    issue.ink_used,
-      production_duration_display: issue.production_duration_display,
+      issue_no: issue.issue_no, machine_name: issue.machine_name,
+      ink_used: issue.ink_used, production_duration_display: issue.production_duration_display,
     });
   } catch (err) {
     console.error("recordProductionCompletion:", err);
@@ -561,20 +481,14 @@ exports.recordReturn = async (req, res) => {
 
     const issue = await MaterialIssue.findById(issueId);
     if (!issue) return resp(res, 404, false, "Material issue record not found.");
-
     if (["returned", "no_return"].includes(issue.status))
-      return resp(res, 409, false,
-        `Return already recorded for ${issue.issue_no}. Use review endpoint for manager notes.`
-      );
-
+      return resp(res, 409, false, `Return already recorded for ${issue.issue_no}.`);
     if (returned_qty > issue.issued_qty)
       return resp(res, 400, false,
-        `Returned qty (${returned_qty}) cannot exceed issued qty (${issue.issued_qty}).`
-      );
+        `Returned qty (${returned_qty}) cannot exceed issued qty (${issue.issued_qty}).`);
 
     const alreadyHasProductionData =
       issue.machine_name || (issue.ink_used?.length > 0) || issue.production_duration_seconds > 0;
-
     if (!alreadyHasProductionData) {
       issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, production_started_at, production_completed_at, production_duration_seconds });
     }
@@ -583,25 +497,17 @@ exports.recordReturn = async (req, res) => {
     await issue.save();
 
     if (returned_qty > 0) {
-      await incrementStock(
-        issue.material.product_id, returned_qty, returned_by.name || "",
-        `Return from job ${issue.job_no} (Issue: ${issue.issue_no})`
-      );
+      await incrementStock(issue.material.product_id, returned_qty, returned_by.name || "",
+        `Return from job ${issue.job_no} (Issue: ${issue.issue_no})`);
     }
 
     const ret = issue.return;
     return resp(res, 200, true, "Material return recorded.", {
-      issue_no:             issue.issue_no,
-      job_no:               issue.job_no,
-      status:               issue.status,
-      issued_qty:           issue.issued_qty,
-      returned_qty:         ret.returned_qty,
-      actual_used_qty:      ret.actual_used_qty,
-      actual_wastage_qty:   ret.actual_wastage_qty,
-      wastage_ratio_pct:    ret.wastage_ratio_pct,
-      performance_rating:   ret.performance_rating,
-      is_flagged:           ret.is_flagged,
-      summary:              buildReturnSummary(issue),
+      issue_no: issue.issue_no, job_no: issue.job_no, status: issue.status,
+      issued_qty: issue.issued_qty, returned_qty: ret.returned_qty,
+      actual_used_qty: ret.actual_used_qty, actual_wastage_qty: ret.actual_wastage_qty,
+      wastage_ratio_pct: ret.wastage_ratio_pct, performance_rating: ret.performance_rating,
+      is_flagged: ret.is_flagged, summary: buildReturnSummary(issue),
     });
   } catch (err) {
     console.error("recordReturn:", err);
@@ -610,7 +516,7 @@ exports.recordReturn = async (req, res) => {
 };
 
 // =============================================================================
-// 5. MANAGER REVIEW  (first-time)
+// 5. MANAGER REVIEW (first-time)
 // POST /api/material/:issueId/review
 // =============================================================================
 exports.managerReview = async (req, res) => {
@@ -622,8 +528,8 @@ exports.managerReview = async (req, res) => {
       return resp(res, 400, false, "manager_by.user_id and manager_by.name are required.");
 
     const issue = await MaterialIssue.findById(issueId);
-    if (!issue) return resp(res, 404, false, "Material issue record not found.");
-    if (!issue.return) return resp(res, 400, false, `No return recorded yet for ${issue.issue_no}.`);
+    if (!issue)         return resp(res, 404, false, "Material issue record not found.");
+    if (!issue.return)  return resp(res, 400, false, `No return recorded yet for ${issue.issue_no}.`);
     if (issue.return.manager_reviewed)
       return resp(res, 409, false, `${issue.issue_no} already reviewed. Use PUT to update.`);
 
@@ -632,8 +538,7 @@ exports.managerReview = async (req, res) => {
 
     return resp(res, 200, true, "Manager review recorded.", {
       issue_no: issue.issue_no, job_no: issue.job_no,
-      performance_rating: issue.return.performance_rating,
-      is_flagged:         issue.return.is_flagged,
+      performance_rating: issue.return.performance_rating, is_flagged: issue.return.is_flagged,
     });
   } catch (err) {
     console.error("managerReview:", err);
@@ -651,13 +556,12 @@ exports.updateManagerReview = async (req, res) => {
     const { manager_by, manager_notes, override_rating } = req.body;
 
     if (!manager_by?.user_id) return resp(res, 400, false, "manager_by is required.");
-
     const issue = await MaterialIssue.findById(issueId);
     if (!issue)        return resp(res, 404, false, "Material issue record not found.");
     if (!issue.return) return resp(res, 400, false, "No return recorded yet.");
 
-    if (manager_notes !== undefined)  issue.return.manager_notes    = manager_notes;
-    if (manager_by)                   issue.return.manager_review_by = manager_by;
+    if (manager_notes !== undefined) issue.return.manager_notes    = manager_notes;
+    if (manager_by)                  issue.return.manager_review_by = manager_by;
     issue.return.manager_review_at = new Date();
     issue.return.manager_reviewed  = true;
 
@@ -675,7 +579,251 @@ exports.updateManagerReview = async (req, res) => {
 };
 
 // =============================================================================
-// 7. GET ALL MATERIAL ISSUES FOR A JOB
+// 7. ASSIGN PICKUP
+// POST /api/material/:issueId/assign-pickup
+//
+// Body:
+//   assigned_to  { user_id, name?, role? }   — person who collects from vendor
+//   delivery_to  "dmedia_office" | "factory" | "customer"
+//   pickup_time  ISO-8601 datetime (must be in the future)
+//   notes?       string
+//   assigned_by  { user_id, name?, role? }   — manager making the assignment (optional)
+//
+// Rules:
+//   • Issue must have calc_mode === "outsource"
+//   • assigned_to.user_id must exist in admin_users collection
+//   • Overwrites any previous assignment (re-assign supported)
+// =============================================================================
+exports.assignPickup = async (req, res) => {
+  try {
+    const { issueId } = req.params;
+    const { assigned_to, delivery_to, pickup_time, notes = "", assigned_by = {} } = req.body;
+
+    // ── Basic validation ──────────────────────────────────────────────────────
+    if (!assigned_to?.user_id)
+      return resp(res, 400, false, "assigned_to.user_id is required.");
+    if (!mongoose.Types.ObjectId.isValid(assigned_to.user_id))
+      return resp(res, 400, false, "assigned_to.user_id is not a valid ObjectId.");
+
+    const VALID_DESTINATIONS = ["dmedia_office", "factory", "customer"];
+    if (!delivery_to || !VALID_DESTINATIONS.includes(delivery_to))
+      return resp(res, 400, false, `delivery_to must be one of: ${VALID_DESTINATIONS.join(", ")}.`);
+
+    if (!pickup_time)
+      return resp(res, 400, false, "pickup_time is required.");
+    if (new Date(pickup_time) <= new Date())
+      return resp(res, 400, false, "pickup_time must be a future datetime.");
+
+    // ── Load issue ────────────────────────────────────────────────────────────
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue)           return resp(res, 404, false, "Material issue not found.");
+    if (issue.is_deleted) return resp(res, 404, false, "Material issue has been deleted.");
+    if (issue.calc_mode !== "outsource")
+      return resp(res, 400, false, "Pickup assignment is only valid for outsource issues.");
+
+    // ── Verify admin user exists ──────────────────────────────────────────────
+    const assignee = await AdminUsers.findById(assigned_to.user_id).lean();
+    if (!assignee)
+      return resp(res, 404, false, `Admin user ${assigned_to.user_id} not found.`);
+
+    // ── Apply via instance method ─────────────────────────────────────────────
+    issue.applyPickupAssignment({
+      assigned_to: {
+        user_id: assignee._id,
+        name:    assigned_to.name || assignee.name || "",
+        role:    assigned_to.role || assignee.role || "",
+      },
+      delivery_to,
+      pickup_time,
+      notes,
+      assigned_by,
+    });
+
+    await issue.save();
+
+    const pa = issue.pickup_assignment;
+    return resp(res, 200, true, "Pickup assignment saved.", {
+      issue_no:    issue.issue_no,
+      issue_id:    issue._id,
+      job_no:      issue.job_no,
+      pickup_assignment: {
+        assigned_to:  pa.assigned_to,
+        delivery_to:  pa.delivery_to,
+        pickup_time:  pa.pickup_time,
+        notes:        pa.notes,
+        assigned_by:  pa.assigned_by,
+        assigned_at:  pa.assigned_at,
+        status:       pa.status,
+      },
+    });
+  } catch (err) {
+    console.error("assignPickup:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// =============================================================================
+// 8. UPDATE PICKUP STATUS
+// PATCH /api/material/:issueId/pickup/status
+//
+// Body:
+//   status  "collected" | "delivered" | "cancelled"
+// =============================================================================
+exports.updatePickupStatus = async (req, res) => {
+  try {
+    // BUG FIX: was using req.params.issueId but route registered the param as :issueId — consistent now
+    const { issueId } = req.params;
+    const { status }  = req.body;
+
+    const ALLOWED = ["collected", "delivered", "cancelled"];
+    if (!status || !ALLOWED.includes(status))
+      return resp(res, 400, false, `status must be one of: ${ALLOWED.join(", ")}.`);
+
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue)           return resp(res, 404, false, "Material issue not found.");
+    if (issue.is_deleted) return resp(res, 404, false, "Material issue has been deleted.");
+    if (issue.calc_mode !== "outsource")
+      return resp(res, 400, false, "Pickup status update is only valid for outsource issues.");
+    if (!issue.pickup_assignment)
+      return resp(res, 400, false, `No pickup assignment found on ${issue.issue_no}. Assign first.`);
+    if (issue.pickup_assignment.status === "delivered")
+      return resp(res, 409, false, "Pickup is already marked as delivered.");
+    if (issue.pickup_assignment.status === "cancelled")
+      return resp(res, 409, false, "Pickup has been cancelled and cannot be updated.");
+
+    issue.updatePickupStatus(status);
+    await issue.save();
+
+    const pa = issue.pickup_assignment;
+    return resp(res, 200, true, `Pickup status updated to "${status}".`, {
+      issue_no:     issue.issue_no,
+      pickup_status: pa.status,
+      collected_at: pa.collected_at,
+      delivered_at: pa.delivered_at,
+    });
+  } catch (err) {
+    console.error("updatePickupStatus:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// =============================================================================
+// 9. GET PICKUPS BY USER
+// GET /api/material/pickups/user/:userId?status=pending&page=1&limit=20
+// =============================================================================
+exports.getPickupsByUser = async (req, res) => {
+  try {
+    const { userId }                                            = req.params;
+    const { status, page = 1, limit = 20, sort_order = "asc" } = req.query;
+
+    if (!mongoose.Types.ObjectId.isValid(userId))
+      return resp(res, 400, false, "Invalid userId.");
+
+    const filter = {
+      is_deleted:  false,
+      calc_mode:   "outsource",
+      "pickup_assignment.assigned_to.user_id": new mongoose.Types.ObjectId(userId),
+    };
+    if (status) filter["pickup_assignment.status"] = status;
+
+    const skip  = (parseInt(page) - 1) * parseInt(limit);
+    const sort  = { "pickup_assignment.pickup_time": sort_order === "desc" ? -1 : 1 };
+    const total = await MaterialIssue.countDocuments(filter);
+
+    const issues = await MaterialIssue.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .populate("pickup_assignment.assigned_to.user_id", "name role email")
+      .lean();
+
+    const allForUser = await MaterialIssue.find({
+      is_deleted: false, calc_mode: "outsource",
+      "pickup_assignment.assigned_to.user_id": new mongoose.Types.ObjectId(userId),
+    }).select("pickup_assignment.status").lean();
+
+    const statusCounts = allForUser.reduce((acc, i) => {
+      const s = i.pickup_assignment?.status || "pending";
+      acc[s] = (acc[s] || 0) + 1;
+      return acc;
+    }, {});
+
+    return resp(res, 200, true, "Pickups for user fetched.", {
+      user_id: userId,
+      issues,
+      pagination: {
+        total, page: parseInt(page), limit: parseInt(limit),
+        total_pages: Math.ceil(total / parseInt(limit)),
+      },
+      summary: statusCounts,
+    });
+  } catch (err) {
+    console.error("getPickupsByUser:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// =============================================================================
+// 10. GET ALL OUTSOURCE ISSUES
+// GET /api/material/outsource?pickup_status=pending&page=1&limit=50
+// =============================================================================
+exports.getOutsourceIssues = async (req, res) => {
+  try {
+    const {
+      pickup_status, outsource_type, job_no,
+      page = 1, limit = 50, sort_by = "createdAt", sort_order = "desc",
+    } = req.query;
+
+    const filter = { is_deleted: false, calc_mode: "outsource" };
+    if (outsource_type) filter.outsource_type = outsource_type;
+    if (job_no)         filter.job_no         = new RegExp(job_no, "i");
+
+    if (pickup_status === "unassigned") {
+      filter.pickup_assignment = null;
+    } else if (pickup_status) {
+      filter["pickup_assignment.status"] = pickup_status;
+    }
+
+    const skip   = (parseInt(page) - 1) * parseInt(limit);
+    const sort   = { [sort_by]: sort_order === "asc" ? 1 : -1 };
+    const total  = await MaterialIssue.countDocuments(filter);
+    const issues = await MaterialIssue.find(filter)
+      .sort(sort).skip(skip).limit(parseInt(limit))
+      .populate("pickup_assignment.assigned_to.user_id", "name role email")
+      .lean();
+
+    const statusAgg = await MaterialIssue.aggregate([
+      { $match: { is_deleted: false, calc_mode: "outsource" } },
+      { $group: {
+        _id: {
+          $cond: [
+            { $eq: ["$pickup_assignment", null] }, "unassigned",
+            "$pickup_assignment.status",
+          ],
+        },
+        count: { $sum: 1 },
+      }},
+    ]);
+    const pickupCounts = statusAgg.reduce((acc, r) => {
+      acc[r._id] = r.count; return acc;
+    }, {});
+
+    return resp(res, 200, true, "Outsource issues fetched.", {
+      issues,
+      pagination: {
+        total, page: parseInt(page), limit: parseInt(limit),
+        total_pages: Math.ceil(total / parseInt(limit)),
+      },
+      pickup_status_counts: pickupCounts,
+    });
+  } catch (err) {
+    console.error("getOutsourceIssues:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// =============================================================================
+// 11. GET ALL MATERIAL ISSUES FOR A JOB
 // GET /api/jobs/:jobId/material
 // =============================================================================
 exports.getJobMaterials = async (req, res) => {
@@ -689,6 +837,7 @@ exports.getJobMaterials = async (req, res) => {
       .populate("issued_to.user_id",       "name role email")
       .populate("issued_by.user_id",       "name role")
       .populate("material.product_id",     "name stock_count")
+      .populate("pickup_assignment.assigned_to.user_id", "name role email")
       .lean();
 
     return resp(res, 200, true, "Material issues for job fetched.", {
@@ -701,7 +850,7 @@ exports.getJobMaterials = async (req, res) => {
 };
 
 // =============================================================================
-// 7b. GET MATERIAL ISSUES FOR A SPECIFIC CART ITEM
+// 12. GET MATERIAL ISSUES FOR A SPECIFIC CART ITEM
 // GET /api/jobs/:jobId/items/:itemId/material
 // =============================================================================
 exports.getItemMaterials = async (req, res) => {
@@ -710,7 +859,6 @@ exports.getItemMaterials = async (req, res) => {
     const issues = await MaterialIssue.find({
       job_id: jobId, cart_item_id: itemId, is_deleted: false,
     }).sort({ createdAt: -1 }).lean();
-
     return resp(res, 200, true, "Item material issues fetched.", { issues, totals: computeJobTotals(issues) });
   } catch (err) {
     console.error("getItemMaterials:", err);
@@ -719,7 +867,7 @@ exports.getItemMaterials = async (req, res) => {
 };
 
 // =============================================================================
-// 7c. GET MATERIAL ISSUES FOR A SPECIFIC DESIGN FILE
+// 13. GET MATERIAL ISSUES FOR A SPECIFIC DESIGN FILE
 // GET /api/material/by-file/:fileId
 // =============================================================================
 exports.getIssuesByDesignFile = async (req, res) => {
@@ -727,11 +875,9 @@ exports.getIssuesByDesignFile = async (req, res) => {
     const { fileId } = req.params;
     if (!mongoose.Types.ObjectId.isValid(fileId))
       return resp(res, 400, false, "Invalid fileId.");
-
     const issues = await MaterialIssue.find({
       design_file_id: new mongoose.Types.ObjectId(fileId), is_deleted: false,
     }).sort({ createdAt: -1 }).lean();
-
     return resp(res, 200, true, "Issues for design file fetched.", { issues });
   } catch (err) {
     console.error("getIssuesByDesignFile:", err);
@@ -740,7 +886,7 @@ exports.getIssuesByDesignFile = async (req, res) => {
 };
 
 // =============================================================================
-// 8. GET SINGLE MATERIAL ISSUE
+// 14. GET SINGLE MATERIAL ISSUE
 // GET /api/material/:issueId
 // =============================================================================
 exports.getMaterialIssue = async (req, res) => {
@@ -750,6 +896,7 @@ exports.getMaterialIssue = async (req, res) => {
       .populate("issued_by.user_id",   "name role")
       .populate("material.product_id", "name stock_count stocks_status")
       .populate("job_id",              "job_no job_status current_stage")
+      .populate("pickup_assignment.assigned_to.user_id", "name role email")
       .lean();
 
     if (!issue) return resp(res, 404, false, "Material issue not found.");
@@ -763,8 +910,8 @@ exports.getMaterialIssue = async (req, res) => {
 };
 
 // =============================================================================
-// 9. GET MATERIAL ISSUES BY EMPLOYEE
-// GET /api/material/employee/:userId?status=returned&page=1&limit=20
+// 15. GET MATERIAL ISSUES BY EMPLOYEE
+// GET /api/material/employee/:userId
 // =============================================================================
 exports.getEmployeeMaterials = async (req, res) => {
   try {
@@ -787,7 +934,6 @@ exports.getEmployeeMaterials = async (req, res) => {
     const avgWastage  = allReturned.length
       ? parseFloat((allReturned.reduce((s, i) => s + (i.return.wastage_ratio_pct || 0), 0) / allReturned.length).toFixed(2))
       : 0;
-
     const ratingCounts = allReturned.reduce((acc, i) => {
       const r = i.return.performance_rating || "acceptable";
       acc[r] = (acc[r] || 0) + 1;
@@ -798,12 +944,10 @@ exports.getEmployeeMaterials = async (req, res) => {
       user_id: userId, issues,
       pagination: { total, page: parseInt(page), limit: parseInt(limit), total_pages: Math.ceil(total / parseInt(limit)) },
       employee_stats: {
-        total_issues:        total,
-        returned_count:      allReturned.length,
-        pending_return:      total - allReturned.length,
-        avg_wastage_pct:     avgWastage,
-        performance_counts:  ratingCounts,
-        overall_rating:      MaterialIssue.ratePerformance(avgWastage),
+        total_issues: total, returned_count: allReturned.length,
+        pending_return: total - allReturned.length,
+        avg_wastage_pct: avgWastage, performance_counts: ratingCounts,
+        overall_rating: MaterialIssue.ratePerformance(avgWastage),
       },
     });
   } catch (err) {
@@ -813,7 +957,7 @@ exports.getEmployeeMaterials = async (req, res) => {
 };
 
 // =============================================================================
-// 10. GET ALL MATERIAL ISSUES (filtered + paginated)
+// 16. GET ALL MATERIAL ISSUES (filtered + paginated)
 // GET /api/material?status=issued&employee_id=...&page=1&limit=20
 // =============================================================================
 exports.getAllMaterialIssues = async (req, res) => {
@@ -825,10 +969,10 @@ exports.getAllMaterialIssues = async (req, res) => {
     } = req.query;
 
     const filter = { is_deleted: false };
-    if (status)          filter.status               = status;
-    if (job_no)          filter.job_no               = new RegExp(job_no, "i");
-    if (is_flagged)      filter["return.is_flagged"]  = is_flagged === "true";
-    if (outsource_type)  filter.outsource_type        = outsource_type;
+    if (status)         filter.status               = status;
+    if (job_no)         filter.job_no               = new RegExp(job_no, "i");
+    if (is_flagged)     filter["return.is_flagged"]  = is_flagged === "true";
+    if (outsource_type) filter.outsource_type        = outsource_type;
     if (manager_reviewed !== undefined)
       filter["return.manager_reviewed"] = manager_reviewed === "true";
     if (employee_id && mongoose.Types.ObjectId.isValid(employee_id))
@@ -841,7 +985,9 @@ exports.getAllMaterialIssues = async (req, res) => {
     const total  = await MaterialIssue.countDocuments(filter);
     const issues = await MaterialIssue.find(filter).sort(sort).skip(skip).limit(parseInt(limit))
       .populate("issued_to.user_id",   "name role")
-      .populate("material.product_id", "name").lean();
+      .populate("material.product_id", "name")
+      .populate("pickup_assignment.assigned_to.user_id", "name role")
+      .lean();
 
     return resp(res, 200, true, "Material issues fetched.", {
       issues,
@@ -854,8 +1000,8 @@ exports.getAllMaterialIssues = async (req, res) => {
 };
 
 // =============================================================================
-// 11. WASTAGE ANALYTICS REPORT
-// GET /api/material/report/wastage?from=...&to=...&employee_id=...
+// 17. WASTAGE ANALYTICS REPORT
+// GET /api/material/report/wastage?from=...&to=...
 // =============================================================================
 exports.wastageReport = async (req, res) => {
   try {
@@ -875,7 +1021,7 @@ exports.wastageReport = async (req, res) => {
     const [overall] = await MaterialIssue.aggregate([
       { $match: matchStage },
       { $group: {
-        _id:                    null,
+        _id: null,
         total_records:          { $sum: 1 },
         total_issued_qty:       { $sum: "$issued_qty" },
         total_returned_qty:     { $sum: "$return.returned_qty" },
@@ -938,12 +1084,10 @@ exports.wastageReport = async (req, res) => {
     ]);
 
     return resp(res, 200, true, "Wastage report generated.", {
-      period:            { from: from || "all time", to: to || "now" },
-      overall:           overall ? { ...overall, _id: undefined, avg_wastage_ratio: parseFloat((overall.avg_wastage_ratio || 0).toFixed(2)) } : null,
-      by_employee:       byEmployee,
-      by_material:       byMaterial,
-      by_wastage_reason: byReason,
-      by_outsource_type: byOutsourceType,
+      period: { from: from || "all time", to: to || "now" },
+      overall: overall ? { ...overall, _id: undefined, avg_wastage_ratio: parseFloat((overall.avg_wastage_ratio || 0).toFixed(2)) } : null,
+      by_employee: byEmployee, by_material: byMaterial,
+      by_wastage_reason: byReason, by_outsource_type: byOutsourceType,
     });
   } catch (err) {
     console.error("wastageReport:", err);
@@ -952,7 +1096,7 @@ exports.wastageReport = async (req, res) => {
 };
 
 // =============================================================================
-// 12. GET FLAGGED ISSUES
+// 18. GET FLAGGED ISSUES
 // GET /api/material/flagged?page=1&limit=20
 // =============================================================================
 exports.getFlaggedIssues = async (req, res) => {
@@ -976,7 +1120,7 @@ exports.getFlaggedIssues = async (req, res) => {
 };
 
 // =============================================================================
-// 13. DELETE MATERIAL ISSUE (soft delete)
+// 19. DELETE MATERIAL ISSUE (soft delete)
 // DELETE /api/material/:issueId
 // =============================================================================
 exports.deleteMaterialIssue = async (req, res) => {
@@ -986,12 +1130,10 @@ exports.deleteMaterialIssue = async (req, res) => {
     if (issue.status !== "issued")
       return resp(res, 400, false, `Cannot delete ${issue.issue_no} — only unprocessed (status=issued) records can be deleted.`);
 
-    // Restore stock (skip for outsource)
     if (issue.outsource_type === "none" || !issue.outsource_type) {
       await incrementStock(issue.material.product_id, issue.issued_qty, "System", `Reversal — deleted ${issue.issue_no}`);
     }
 
-    // Clear cart_item fields on Job
     await Job.findByIdAndUpdate(issue.job_id, {
       $unset: {
         [`cart_items.${issue.cart_item_index}.outsource_type`]:    "",
@@ -1013,16 +1155,16 @@ exports.deleteMaterialIssue = async (req, res) => {
 };
 
 // =============================================================================
-// 14. LIST ISSUES (simple — internal tools / store manager overview)
-// GET /material?limit=50&status=issued&job_id=xxx&flagged=true
+// 20. LIST ISSUES (simple — internal tools / store manager overview)
+// GET /api/material/list?limit=50&status=issued&job_id=xxx&flagged=true
 // =============================================================================
 exports.listIssues = async (req, res) => {
   try {
     const { limit = 50, page = 1, status, job_id, flagged } = req.query;
     const filter = { is_deleted: { $ne: true } };
-    if (status)             filter.status               = status;
-    if (job_id)             filter.job_id               = job_id;
-    if (flagged === "true") filter["return.is_flagged"]  = true;
+    if (status)             filter.status              = status;
+    if (job_id)             filter.job_id              = job_id;
+    if (flagged === "true") filter["return.is_flagged"] = true;
 
     const skip   = (parseInt(page) - 1) * parseInt(limit);
     const total  = await MaterialIssue.countDocuments(filter);

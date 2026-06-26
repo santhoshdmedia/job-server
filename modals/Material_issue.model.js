@@ -3,7 +3,12 @@
 // the subsequent return + wastage performance review,
 // and production metadata (machine, ink, duration).
 //
-// KEY CHANGES (v2):
+// KEY CHANGES (v3):
+//  • pickup_assignment sub-schema added
+//    – assigned_to.user_id refs admin_users (required)
+//    – delivery_to enum: "dmedia_office" | "factory" | "customer"
+//    – pickup_time (Date, required)
+//    – notes, assigned_by, assigned_at
 //  • printing_dimensions + media_dimensions stored on the record
 //  • calc_mode "dimensions" added (frontend two-dim flow)
 //  • design_file_id links an issue to a specific per-item design file
@@ -167,6 +172,78 @@ const returnSchema = new Schema(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-Schema: Pickup Assignment (NEW v3)
+//
+// Records who should collect the outsourced item from the vendor,
+// where to deliver it, and when.
+//
+// Fields:
+//   assigned_to.user_id  — ObjectId ref to admin_users (required)
+//   assigned_to.name     — denormalised for fast display
+//   assigned_to.role     — denormalised role string
+//   delivery_to          — one of three drop-off points
+//   pickup_time          — scheduled collection datetime
+//   notes                — optional handling instructions
+//   assigned_by          — who created this assignment (store manager / super admin)
+//   assigned_at          — wall-clock timestamp of assignment creation
+//   status               — lifecycle of the pickup task
+// ─────────────────────────────────────────────────────────────────────────────
+const pickupAssignmentSchema = new Schema(
+  {
+    // ── Person collecting from vendor ────────────────────────────────────────
+    assigned_to: {
+      user_id: {
+        type:     Schema.Types.ObjectId,
+        ref:      "admin_users",
+        required: true,
+      },
+      name: { type: String, default: "" },
+      role: { type: String, default: "" },
+    },
+
+    // ── Where to deliver after pickup ────────────────────────────────────────
+    // "dmedia_office" — main office reception
+    // "factory"       — production floor
+    // "customer"      — direct delivery to customer site
+    delivery_to: {
+      type:     String,
+      enum:     ["dmedia_office", "factory", "customer"],
+      required: true,
+    },
+
+    // ── When to collect ──────────────────────────────────────────────────────
+    pickup_time: { type: Date, required: true },
+
+    // ── Optional instructions ────────────────────────────────────────────────
+    notes: { type: String, default: "" },
+
+    // ── Audit: who created this assignment ───────────────────────────────────
+    assigned_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+    assigned_at: { type: Date, default: Date.now },
+
+    // ── Pickup lifecycle ─────────────────────────────────────────────────────
+    // "pending"    — assigned, not yet collected
+    // "collected"  — person has picked up from vendor
+    // "delivered"  — item has reached the delivery_to location
+    // "cancelled"  — assignment was cancelled
+    status: {
+      type:    String,
+      enum:    ["pending", "collected", "delivered", "cancelled"],
+      default: "pending",
+      index:   true,
+    },
+
+    collected_at: { type: Date, default: null },
+    delivered_at: { type: Date, default: null },
+  },
+  { _id: false }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Schema: Material Issue
 // ─────────────────────────────────────────────────────────────────────────────
 const materialIssueSchema = new Schema(
@@ -174,7 +251,7 @@ const materialIssueSchema = new Schema(
     // ── Issue reference ──────────────────────────────────────────────────────
     issue_no: { type: String, unique: true, index: true },
 
-    // ── Calc mode:
+    // ── Calc mode ────────────────────────────────────────────────────────────
     //    "server"     — legacy: width/height → server calculates sqft
     //    "sqft"       — cart provided a flat sqft number
     //    "dimensions" — frontend provides printing + media dimensions
@@ -195,13 +272,11 @@ const materialIssueSchema = new Schema(
     // ── Cart item reference ──────────────────────────────────────────────────
     cart_item_index: { type: Number, default: 0 },
     cart_item_name:  { type: String, default: "" },
-    cart_item_id:    { type: String, default: "" }, // item_id from jobCartItemSchema
+    cart_item_id:    { type: String, default: "" },
 
-    // ── Design file linkage (NEW) ────────────────────────────────────────────
-    // When a material issue is created from a specific design file upload,
-    // store its _id here so we can link issue ↔ design file bidirectionally.
+    // ── Design file linkage ──────────────────────────────────────────────────
     design_file_id:    { type: Schema.Types.ObjectId, default: null },
-    design_file_label: { type: String, default: "" }, // e.g. "Cutting File"
+    design_file_label: { type: String, default: "" },
 
     // ── Material ─────────────────────────────────────────────────────────────
     material: {
@@ -226,30 +301,30 @@ const materialIssueSchema = new Schema(
       role:    { type: String, default: "" },
     },
 
-    // ── Dimensions (legacy server-calc mode) ─────────────────────────────────
+    // ── Dimensions ───────────────────────────────────────────────────────────
     dimensions: {
       type: dimensionsSchema,
       default: () => ({ width: 0, height: 0, unit: "ft" }),
     },
-
-    // ── NEW: Printing dimensions (actual artwork / print area) ────────────────
     printing_dimensions: { type: dimensionDetailSchema, default: null },
+    media_dimensions:    { type: dimensionDetailSchema, default: null },
+    wastage_sqft:        { type: Number, default: 0 },
 
-    // ── NEW: Media dimensions (roll/sheet cut from) ───────────────────────────
-    media_dimensions: { type: dimensionDetailSchema, default: null },
-
-    // ── NEW: Wastage between media and printing ───────────────────────────────
-    wastage_sqft: { type: Number, default: 0 },
-
-    // ── System calculation breakdown ─────────────────────────────────────────
+    // ── Calculation snapshot ─────────────────────────────────────────────────
     calculation: { type: calculationSchema, default: () => ({}) },
 
-    // ── Issue notes ──────────────────────────────────────────────────────────
+    // ── Notes ────────────────────────────────────────────────────────────────
     issue_notes: { type: String, default: "" },
 
     // ── Outsource ────────────────────────────────────────────────────────────
     outsource_type:   { type: String, default: "none", index: true },
     outsource_vendor: { type: String, default: "" },
+
+    // ── Pickup Assignment (NEW) ───────────────────────────────────────────────
+    // Only populated for calc_mode === "outsource" records.
+    // null  → not yet assigned
+    // object → assignment exists (see pickupAssignmentSchema above)
+    pickup_assignment: { type: pickupAssignmentSchema, default: null },
 
     // ── Production metadata ──────────────────────────────────────────────────
     machine_name: { type: String, default: "" },
@@ -290,6 +365,10 @@ materialIssueSchema.index({ status: 1, createdAt: -1 });
 materialIssueSchema.index({ "return.is_flagged": 1 });
 materialIssueSchema.index({ design_file_id: 1 });
 materialIssueSchema.index({ cart_item_id: 1 });
+// Pickup-specific indexes
+materialIssueSchema.index({ "pickup_assignment.assigned_to.user_id": 1 });
+materialIssueSchema.index({ "pickup_assignment.status": 1, "pickup_assignment.pickup_time": 1 });
+materialIssueSchema.index({ calc_mode: 1, "pickup_assignment.status": 1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static: Auto-generate issue number  MI0001, MI0002 …
@@ -337,11 +416,11 @@ materialIssueSchema.methods.applyProductionCompletion = function ({
   production_completed_at   = null,
   production_duration_seconds = 0,
 }) {
-  this.machine_name              = machine_name;
-  this.ink_used                  = ink_used;
-  this.ink_notes                 = ink_notes;
-  this.production_started_at     = production_started_at  ? new Date(production_started_at)  : null;
-  this.production_completed_at   = production_completed_at ? new Date(production_completed_at) : new Date();
+  this.machine_name            = machine_name;
+  this.ink_used                = ink_used;
+  this.ink_notes               = ink_notes;
+  this.production_started_at   = production_started_at  ? new Date(production_started_at)  : null;
+  this.production_completed_at = production_completed_at ? new Date(production_completed_at) : new Date();
 
   const secs = parseInt(production_duration_seconds, 10) || 0;
   this.production_duration_seconds = secs;
@@ -362,7 +441,6 @@ materialIssueSchema.methods.applyReturn = function ({
 
   const returned         = Math.max(0, returned_qty);
   const actual_used      = parseFloat((issued - returned).toFixed(4));
-  // job_sqft is the net print area; for dimensions mode use print_sqft
   const netPrintArea     = calc.print_sqft || calc.job_sqft || 0;
   const actual_wastage   = parseFloat((actual_used - netPrintArea).toFixed(4));
   const expected_wastage = parseFloat(((calc.gross_sqft || calc.media_sqft || 0) - netPrintArea).toFixed(4));
@@ -389,6 +467,65 @@ materialIssueSchema.methods.applyReturn = function ({
   };
 
   this.status = returned_qty > 0 ? "returned" : "no_return";
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance: Apply pickup assignment
+// ─────────────────────────────────────────────────────────────────────────────
+materialIssueSchema.methods.applyPickupAssignment = function ({
+  assigned_to,
+  delivery_to,
+  pickup_time,
+  notes       = "",
+  assigned_by = {},
+}) {
+  if (this.calc_mode !== "outsource") {
+    throw new Error("Pickup assignment is only valid for outsource issues.");
+  }
+  if (!assigned_to?.user_id) {
+    throw new Error("assigned_to.user_id is required.");
+  }
+  if (!["dmedia_office", "factory", "customer"].includes(delivery_to)) {
+    throw new Error("delivery_to must be one of: dmedia_office, factory, customer.");
+  }
+  if (!pickup_time || new Date(pickup_time) <= new Date()) {
+    throw new Error("pickup_time must be a future date.");
+  }
+
+  this.pickup_assignment = {
+    assigned_to: {
+      user_id: assigned_to.user_id,
+      name:    assigned_to.name || "",
+      role:    assigned_to.role || "",
+    },
+    delivery_to,
+    pickup_time:  new Date(pickup_time),
+    notes:        notes.trim(),
+    assigned_by: {
+      user_id: assigned_by.user_id || null,
+      name:    assigned_by.name    || "",
+      role:    assigned_by.role    || "",
+    },
+    assigned_at: new Date(),
+    status:      "pending",
+  };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance: Update pickup status (collected / delivered / cancelled)
+// ─────────────────────────────────────────────────────────────────────────────
+materialIssueSchema.methods.updatePickupStatus = function (newStatus) {
+  const allowed = ["collected", "delivered", "cancelled"];
+  if (!allowed.includes(newStatus)) {
+    throw new Error(`Invalid pickup status. Must be one of: ${allowed.join(", ")}`);
+  }
+  if (!this.pickup_assignment) {
+    throw new Error("No pickup assignment found on this issue.");
+  }
+
+  this.pickup_assignment.status = newStatus;
+  if (newStatus === "collected") this.pickup_assignment.collected_at = new Date();
+  if (newStatus === "delivered") this.pickup_assignment.delivered_at = new Date();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
