@@ -60,7 +60,7 @@ const ROLE_DEFAULT_PAGES = {
 // ─────────────────────────────────────────────
 const getDefaultPermissionsForRole = (role) => {
   // Super admin → full access to all pages
-  if (role === "super admin") {
+  if (role === "super admin"||role === "admin") {
     return AVAILABLE_PAGES.map((page) => ({
       pageName:  page.value,
       canView:   true,
