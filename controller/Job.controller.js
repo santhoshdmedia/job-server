@@ -31,7 +31,7 @@ const toPlain = (doc) => {
 // allowed through so nothing existing breaks. Any caller that DOES send a
 // role is held to it.
 // ─────────────────────────────────────────────────────────────────────────────
-const MANAGER_ROLES = ["admin", "super admin"];
+const MANAGER_ROLES = ["admin", "super admin","designing team"];
 const isManagerRole = (role) => MANAGER_ROLES.includes(String(role || "").toLowerCase().trim());
 
 const requireManagerRole = (res, handledBy, actionLabel) => {
