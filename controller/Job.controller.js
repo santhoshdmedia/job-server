@@ -915,8 +915,8 @@ exports.updateJob = async (req, res) => {
       "delivery_address", "estimated_delivery_date", "order_date",
       "subtotal", "discount_percentage", "discount_amount", "taxable_amount",
       "tax_amount", "delivery_charges", "free_delivery", "total_amount",
+      "rounding_adjustment", "design_charges",
       "gst_no", "valid_until", "notes", "terms_and_conditions",
-      "payment_amount", "payment_mode", "balance_amount",
     ];
 
     const updates = {};
@@ -927,21 +927,26 @@ exports.updateJob = async (req, res) => {
     if (!Object.keys(updates).length)
       return resp(res, 400, false, "No valid fields provided to update.");
 
-    const job = await Job.findByIdAndUpdate(
-      req.params.id,
-      { $set: updates },
-      { new: true, runValidators: true },
-    ).lean();
-
+    // Use a full document load so the pre-save hook (recomputePayments)
+    // fires correctly when total_amount changes.
+    const job = await Job.findById(req.params.id);
     if (!job) return resp(res, 404, false, "Job not found.");
 
-    return resp(res, 200, true, "Job updated successfully.", job);
+    Object.assign(job, updates);
+    // Explicitly trigger recompute in case total_amount changed but
+    // the hook hasn't detected it as modified yet.
+    if (updates.total_amount !== undefined) {
+      job.recomputePayments();
+    }
+
+    await job.save();
+
+    return resp(res, 200, true, "Job updated successfully.", job.toObject());
   } catch (err) {
     console.error("❌ updateJob", err);
     return resp(res, 500, false, err.message);
   }
 };
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 13. UPDATE JOB STATUS
 // PATCH /api/jobs/:id/status
@@ -1194,25 +1199,48 @@ exports.rejectDesignFile = async (req, res) => {
 exports.collectPayment = async (req, res) => {
   try {
     const { id } = req.params;
-    const { amount, method = "", notes = "", next_due_date = null } = req.body;
- 
-    const job = await Job.findById(id);
-    if (!job) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
- 
-    const profile = req.user || {}; // however you attach the authenticated admin
- 
-    job.addPayment({
+    const {
       amount,
-      method,
-      notes,
-      next_due_date,
-      collected_by: { user_id: profile._id || null, name: profile.name || "" },
-    });
- 
+      method       = "",
+      notes        = "",
+      next_due_date = null,
+      discount_applied = 0,   // ← NEW: waiver/discount before collecting
+    } = req.body;
+
+    const job = await Job.findById(id);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+
+    const profile = req.user || {};
+
+    // Apply discount waiver first — reduces total_amount permanently
+    const discountAmt = parseFloat(discount_applied) || 0;
+    if (discountAmt > 0) {
+      const currentBalance = parseFloat(job.balance_amount || 0);
+      if (discountAmt > currentBalance + 0.01) {
+        return res.status(400).json({
+          success: false,
+          message: `Discount (₹${discountAmt.toFixed(2)}) exceeds current balance (₹${currentBalance.toFixed(2)}).`,
+        });
+      }
+      // Reduce the job total by the discount so balance shrinks accordingly
+      job.total_amount = parseFloat((job.total_amount - discountAmt).toFixed(2));
+      job.discount_amount = parseFloat(((job.discount_amount || 0) + discountAmt).toFixed(2));
+      job.recomputePayments(); // recalculate balance after discount
+    }
+
+    // Now record the actual cash payment (if any)
+    if (parseFloat(amount) > 0) {
+      job.addPayment({
+        amount,
+        method,
+        notes,
+        next_due_date,
+        collected_by: { user_id: profile._id || null, name: profile.name || "" },
+      });
+    }
+
     await job.save();
- 
+
     return res.json({
       success: true,
       message: "Payment recorded successfully",

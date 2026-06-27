@@ -8,7 +8,7 @@ const { upload } = require("../helper/multer.helper");
 const { VerfiyToken } = require("../helper/shared.helper");
 
 
-const { auth_routes, admin_routers,job_routers,product_routers,staff_routers,meterial_routers,Inforequest_routes,visit_routers } = require("../routes/routes_import");
+const { auth_routes, admin_routers,job_routers,product_routers,staff_routers,meterial_routers,Inforequest_routes,visit_routers,staffMonitor } = require("../routes/routes_import");
 // const { route } = require("./mail.routes");
     ``
 router.use("/auth", auth_routes);
@@ -20,6 +20,7 @@ router.use("/staff", staff_routers);
 router.use("/material", meterial_routers);
 router.use("/info-requests", Inforequest_routes);
 router.use("/site-visits", visit_routers);
+router.use("/staff-monitor",staffMonitor)
 // router.use("/quotation", QuotationRoutes);
 // pdf export
 module.exports = router;
