@@ -11,19 +11,31 @@
  *   POST   /task-log                   submitTaskLog
  *   DELETE /task-log/:logId            deleteTaskLog
  *
- * CHANGES vs previous version:
- *   - recordLogin     : now saves selfie_url + location (lat/lng/accuracy) from request body
- *   - getMonitorList  : now returns latestSelfie { selfie_url, location, login_at } per staff
- *   - getStaffDetails : now returns selfie_url + location on each session object
+ * KEY BEHAVIOURS:
+ *   - recordLogin: saves selfie_url + location (lat/lng/accuracy).
+ *                  Reverse-geocodes coordinates into a human-readable
+ *                  formatted_address + place_name using the free
+ *                  Nominatim API (no key required).
+ *                  Falls back gracefully when geocoding fails or coords
+ *                  are absent.
+ *   - getMonitorList: returns latestSelfie { selfie_url, location, login_at }
+ *                     per staff member, with location.formatted_address
+ *                     ready for the frontend to display directly.
+ *   - getStaffDetails: every session object now carries selfie_url + full
+ *                      location sub-document.
  */
 
-const AdminUsersSchema           = require("../modals/adminusers.modals");
+const axios                          = require("axios");
+const AdminUsersSchema               = require("../modals/adminusers.modals");
 const { StaffSession, StaffTaskLog } = require("../modals/Staffmonitor.model");
-const Job                        = require("../modals/job.modal");
+const Job                            = require("../modals/job.modal");
 const { successResponse, errorResponse } = require("../helper/response.helper");
 
+// ─── Roles that are permitted to skip the selfie ──────────────────────────────
+const BYPASS_ROLES = ["super_admin", "super admin", "admin"];
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Utility
+// Utility helpers
 // ─────────────────────────────────────────────────────────────────────────────
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
@@ -36,8 +48,53 @@ const secsToDisplay = (total) => {
 };
 
 /**
- * Given a list of workflow_stages from a job, extract all work done by a
- * specific user and return per-stage totals + individual sessions.
+ * reverseGeocode
+ * Calls the Nominatim reverse-geocoding API (free, no key required).
+ * Returns { formatted_address, place_name } or empty strings on failure.
+ *
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {Promise<{ formatted_address: string, place_name: string }>}
+ */
+const reverseGeocode = async (lat, lng) => {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=16&addressdetails=1`;
+    const { data } = await axios.get(url, {
+      timeout: 6000,
+      headers: {
+        // Nominatim requires a descriptive User-Agent to avoid rate-limiting
+        "User-Agent": "JobSheetApp/1.0 (staff-attendance-monitor)",
+        "Accept-Language": "en",
+      },
+    });
+
+    const addr    = data?.address || {};
+    const display = data?.display_name || "";
+
+    // Build a shorter, friendlier address: "Road, Area, City, State"
+    const parts = [
+      addr.road || addr.pedestrian || addr.footway || "",
+      addr.suburb || addr.neighbourhood || addr.quarter || "",
+      addr.city || addr.town || addr.village || addr.hamlet || "",
+      addr.state || "",
+    ].filter(Boolean);
+
+    const formatted_address = parts.length ? parts.join(", ") : display;
+
+    // place_name: the smallest-named locality
+    const place_name =
+      addr.city || addr.town || addr.village || addr.hamlet || addr.suburb || "";
+
+    return { formatted_address, place_name };
+  } catch (err) {
+    console.warn("[reverseGeocode] Failed:", err?.message);
+    return { formatted_address: "", place_name: "" };
+  }
+};
+
+/**
+ * extractUserWorkFromStages
+ * Returns per-stage work breakdown + total seconds for a given user.
  */
 const extractUserWorkFromStages = (stages = [], userId) => {
   const result = [];
@@ -51,7 +108,7 @@ const extractUserWorkFromStages = (stages = [], userId) => {
       (s) => !s.user_id || s.user_id?.toString() === userId,
     );
 
-    let stageSecs = 0;
+    let stageSecs  = 0;
     const sessions = userSessions.map((s) => {
       let secs = 0;
       if (s.session_start) {
@@ -90,34 +147,66 @@ const extractUserWorkFromStages = (stages = [], userId) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /session/login
+//
 // Body: { staffId, selfie_url?, latitude?, longitude?, accuracy? }
 //
-// CHANGED: saves selfie_url + location to the session document.
+// Behaviour:
+//   • All roles: selfie expected — controller accepts whatever the frontend
+//     sends (selfie enforcement lives in the UI).
+//   • Reverse-geocodes lat/lng when present and stores formatted_address +
+//     place_name on the location sub-document.
+//   • Closes any ghost open session before creating the new one.
 // ─────────────────────────────────────────────────────────────────────────────
 const recordLogin = async (req, res) => {
   try {
     const { staffId, selfie_url, latitude, longitude, accuracy } = req.body;
     if (!staffId) return errorResponse(res, "staffId is required.");
 
-    const staff = await AdminUsersSchema.findById(staffId).select("name role isOnline").lean();
+    const staff = await AdminUsersSchema.findById(staffId)
+      .select("name role isOnline")
+      .lean();
     if (!staff) return errorResponse(res, "Staff not found.");
 
     const now = new Date();
 
-    // Close any ghost open session first
+    // ── Close any ghost open session ─────────────────────────────────────────
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (openSession) {
       openSession.logout_at        = now;
-      openSession.duration_seconds = Math.max(0, Math.floor((now - openSession.login_at) / 1000));
+      openSession.duration_seconds = Math.max(
+        0,
+        Math.floor((now - openSession.login_at) / 1000),
+      );
       await openSession.save();
     }
 
-    // Build location sub-doc only if coordinates were provided
-    const hasLocation = latitude != null && longitude != null;
-    const locationData = hasLocation
-      ? { latitude: parseFloat(latitude), longitude: parseFloat(longitude), accuracy: accuracy ? parseFloat(accuracy) : null }
-      : { latitude: null, longitude: null, accuracy: null };
+    // ── Resolve location ─────────────────────────────────────────────────────
+    const hasCoords = latitude != null && longitude != null;
+    let locationData = {
+      latitude:          null,
+      longitude:         null,
+      accuracy:          null,
+      formatted_address: "",
+      place_name:        "",
+    };
 
+    if (hasCoords) {
+      const lat = parseFloat(latitude);
+      const lng = parseFloat(longitude);
+
+      // Reverse-geocode to get a human-readable address
+      const { formatted_address, place_name } = await reverseGeocode(lat, lng);
+
+      locationData = {
+        latitude:          lat,
+        longitude:         lng,
+        accuracy:          accuracy != null ? parseFloat(accuracy) : null,
+        formatted_address: formatted_address || `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+        place_name,
+      };
+    }
+
+    // ── Create session ───────────────────────────────────────────────────────
     const session = await StaffSession.create({
       staff_id:   staffId,
       login_at:   now,
@@ -150,7 +239,10 @@ const recordLogout = async (req, res) => {
 
     if (openSession) {
       openSession.logout_at        = now;
-      openSession.duration_seconds = Math.max(0, Math.floor((now - openSession.login_at) / 1000));
+      openSession.duration_seconds = Math.max(
+        0,
+        Math.floor((now - openSession.login_at) / 1000),
+      );
       await openSession.save();
     }
 
@@ -166,34 +258,42 @@ const recordLogout = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /monitor
 //
-// CHANGED: now also returns latestSelfie per staff — the most recent session
-// that has a selfie_url (today's login selfie for the monitor card).
-//
-// Added to each staff item:
-//   latestSelfie: { selfie_url, location, login_at } | null
+// Returns one entry per staff member with:
+//   latestSelfie: {
+//     selfie_url,
+//     location: { latitude, longitude, accuracy, formatted_address, place_name },
+//     login_at
+//   } | null
 // ─────────────────────────────────────────────────────────────────────────────
 const getMonitorList = async (req, res) => {
   try {
     const today = todayStr();
 
-    const staffList = await AdminUsersSchema.find({}, {
-      name: 1, email: 1, role: 1, profileImg: 1, isOnline: 1, available: 1,
-    }).lean();
+    const staffList = await AdminUsersSchema.find(
+      {},
+      { name: 1, email: 1, role: 1, profileImg: 1, isOnline: 1, available: 1 },
+    ).lean();
 
     const staffIds    = staffList.map((s) => s._id);
     const staffIdStrs = staffIds.map((id) => id.toString());
 
-    // ── Login sessions ────────────────────────────────────────────────────
+    // ── Login sessions for today ──────────────────────────────────────────
     const todaySessions = await StaffSession.find({
       staff_id: { $in: staffIds },
       date:     today,
     }).lean();
 
-    // ── Latest selfie per staff (most recent session with a selfie_url) ───
-    //    We query the last session per staff that has a non-empty selfie_url.
+    // ── Latest selfie per staff ───────────────────────────────────────────
+    //    Most recent session that has a selfie_url (all-time, not just today,
+    //    so the card always shows something even if today had no selfie).
     const latestSelfieAgg = await StaffSession.aggregate([
-      { $match: { staff_id: { $in: staffIds }, selfie_url: { $nin: [null, ""] } } },
-      { $sort:  { login_at: -1 } },
+      {
+        $match: {
+          staff_id:   { $in: staffIds },
+          selfie_url: { $nin: [null, ""] },
+        },
+      },
+      { $sort: { login_at: -1 } },
       {
         $group: {
           _id:        "$staff_id",
@@ -203,22 +303,35 @@ const getMonitorList = async (req, res) => {
         },
       },
     ]);
+
     const selfieMap = {};
     for (const s of latestSelfieAgg) {
       selfieMap[s._id.toString()] = {
         selfie_url: s.selfie_url,
-        location:   s.location,
+        location:   s.location,   // includes formatted_address + place_name
         login_at:   s.login_at,
       };
     }
 
-    // ── Task logs ─────────────────────────────────────────────────────────
+    // ── Task log counts ───────────────────────────────────────────────────
     const startOfDay    = new Date(`${today}T00:00:00.000Z`);
     const endOfDay      = new Date(`${today}T23:59:59.999Z`);
     const taskLogCounts = await StaffTaskLog.aggregate([
-      { $match: { staff_id: { $in: staffIds }, submitted_at: { $gte: startOfDay, $lte: endOfDay } } },
-      { $group: { _id: "$staff_id", count: { $sum: 1 }, lastAt: { $max: "$submitted_at" } } },
+      {
+        $match: {
+          staff_id:     { $in: staffIds },
+          submitted_at: { $gte: startOfDay, $lte: endOfDay },
+        },
+      },
+      {
+        $group: {
+          _id:    "$staff_id",
+          count:  { $sum: 1 },
+          lastAt: { $max: "$submitted_at" },
+        },
+      },
     ]);
+
     const taskMap = {};
     for (const t of taskLogCounts) taskMap[t._id.toString()] = t;
 
@@ -246,17 +359,24 @@ const getMonitorList = async (req, res) => {
 
         jobStatsMap[handlerId].jobsAssignedTotal += 1;
 
-        const hasOpen = (stage.work_sessions || []).some((s) => s.session_start && !s.session_end);
+        const hasOpen = (stage.work_sessions || []).some(
+          (s) => s.session_start && !s.session_end,
+        );
         if (hasOpen) jobStatsMap[handlerId].activeJobs += 1;
 
         for (const sess of stage.work_sessions || []) {
           if (!sess.session_start) continue;
           const end  = sess.session_end ? new Date(sess.session_end) : new Date();
-          const secs = Math.max(0, Math.floor((end - new Date(sess.session_start)) / 1000));
+          const secs = Math.max(
+            0,
+            Math.floor((end - new Date(sess.session_start)) / 1000),
+          );
 
           jobStatsMap[handlerId].totalJobSecondsAll += secs;
 
-          const sessionDate = (sess.work_date || new Date(sess.session_start).toISOString()).slice(0, 10);
+          const sessionDate = (
+            sess.work_date || new Date(sess.session_start).toISOString()
+          ).slice(0, 10);
           if (sessionDate === today) {
             jobStatsMap[handlerId].totalJobSecondsToday += secs;
           }
@@ -264,7 +384,7 @@ const getMonitorList = async (req, res) => {
       }
     }
 
-    // ── Build session maps ────────────────────────────────────────────────
+    // ── Session map by staff ──────────────────────────────────────────────
     const sessionMap = {};
     for (const s of todaySessions) {
       const key = s.staff_id.toString();
@@ -284,20 +404,23 @@ const getMonitorList = async (req, res) => {
         return acc + Math.floor((Date.now() - new Date(s.login_at).getTime()) / 1000);
       }, 0);
 
-      const openSession  = sessions.find((s) => !s.logout_at);
-      const lastLogout   = sessions.filter((s) => s.logout_at).sort((a, b) => b.logout_at - a.logout_at)[0]?.logout_at;
-      const lastActivity = taskInfo.lastAt > lastLogout ? taskInfo.lastAt : lastLogout;
+      const openSession = sessions.find((s) => !s.logout_at);
+      const lastLogout  = sessions
+        .filter((s) => s.logout_at)
+        .sort((a, b) => new Date(b.logout_at) - new Date(a.logout_at))[0]?.logout_at;
+
+      const lastActivity =
+        taskInfo.lastAt > lastLogout ? taskInfo.lastAt : lastLogout;
 
       return {
         ...staff,
         todaySeconds,
-        todaySessions:    sessions.length,
-        taskLogsToday:    taskInfo.count,
-        currentLoginAt:   openSession?.login_at || null,
-        lastActivity:     lastActivity || null,
-        // ── Selfie + location for monitor card ────────────────────────────
-        latestSelfie:     selfieMap[id] || null,
-        // ── Job stats ─────────────────────────────────────────────────────
+        todaySessions:  sessions.length,
+        taskLogsToday:  taskInfo.count,
+        currentLoginAt: openSession?.login_at || null,
+        lastActivity:   lastActivity || null,
+        // latestSelfie.location already has formatted_address + place_name
+        latestSelfie:   selfieMap[id] || null,
         jobStats: {
           activeJobs:           js.activeJobs           ?? 0,
           totalJobSecondsToday: js.totalJobSecondsToday ?? 0,
@@ -309,6 +432,7 @@ const getMonitorList = async (req, res) => {
       };
     });
 
+    // Online staff first, then alphabetical
     result.sort((a, b) => {
       if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
       return a.name.localeCompare(b.name);
@@ -323,7 +447,7 @@ const getMonitorList = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /monitor/:id/details
-// CHANGED: sessions now include selfie_url + location fields.
+// Sessions now carry selfie_url + full location (with formatted_address).
 // ─────────────────────────────────────────────────────────────────────────────
 const getStaffDetails = async (req, res) => {
   try {
@@ -332,7 +456,6 @@ const getStaffDetails = async (req, res) => {
     const staff = await AdminUsersSchema.findById(id, { password: 0 }).lean();
     if (!staff) return errorResponse(res, "Staff not found.");
 
-    // Sessions now include selfie_url + location (already in the schema)
     const sessions = await StaffSession.find({ staff_id: id })
       .sort({ login_at: -1 })
       .lean();
@@ -344,14 +467,19 @@ const getStaffDetails = async (req, res) => {
     const assignedJobs = await Job.find({
       "workflow_stages.handled_by.user_id": id,
     })
-      .select("job_no customer_name company_name job_status current_stage workflow_stages order_date createdAt")
+      .select(
+        "job_no customer_name company_name job_status current_stage workflow_stages order_date createdAt",
+      )
       .lean();
 
     let totalJobSeconds = 0;
     let activeJobCount  = 0;
 
     const jobAssignments = assignedJobs.map((job) => {
-      const { stages, totalSeconds } = extractUserWorkFromStages(job.workflow_stages, id);
+      const { stages, totalSeconds } = extractUserWorkFromStages(
+        job.workflow_stages,
+        id,
+      );
       const isCurrentlyActive = stages.some((s) => s.has_open_session);
 
       totalJobSeconds += totalSeconds;
@@ -373,13 +501,14 @@ const getStaffDetails = async (req, res) => {
     });
 
     jobAssignments.sort((a, b) => {
-      if (a.isCurrentlyActive !== b.isCurrentlyActive) return a.isCurrentlyActive ? -1 : 1;
+      if (a.isCurrentlyActive !== b.isCurrentlyActive)
+        return a.isCurrentlyActive ? -1 : 1;
       return b.totalSeconds - a.totalSeconds;
     });
 
     return successResponse(res, "Staff details fetched.", {
       staff,
-      sessions,   // each session now carries selfie_url + location
+      sessions,   // each session carries selfie_url + location.formatted_address
       taskLogs,
       jobAssignments,
       jobTimeSummary: {
@@ -403,21 +532,28 @@ const getStaffJobTime = async (req, res) => {
     const { id }    = req.params;
     const { jobNo } = req.query;
 
-    const staff = await AdminUsersSchema.findById(id, { name: 1, role: 1, email: 1, profileImg: 1 }).lean();
+    const staff = await AdminUsersSchema.findById(id, {
+      name: 1, role: 1, email: 1, profileImg: 1,
+    }).lean();
     if (!staff) return errorResponse(res, "Staff not found.");
 
     const jobFilter = { "workflow_stages.handled_by.user_id": id };
     if (jobNo) jobFilter.job_no = jobNo;
 
     const assignedJobs = await Job.find(jobFilter)
-      .select("job_no customer_name company_name job_status current_stage workflow_stages order_date createdAt estimated_delivery_date")
+      .select(
+        "job_no customer_name company_name job_status current_stage workflow_stages order_date createdAt estimated_delivery_date",
+      )
       .lean();
 
     let totalSeconds   = 0;
     let activeJobCount = 0;
 
     const jobs = assignedJobs.map((job) => {
-      const { stages, totalSeconds: jobSecs } = extractUserWorkFromStages(job.workflow_stages, id);
+      const { stages, totalSeconds: jobSecs } = extractUserWorkFromStages(
+        job.workflow_stages,
+        id,
+      );
       const isCurrentlyActive = stages.some((s) => s.has_open_session);
 
       totalSeconds   += jobSecs;
@@ -440,7 +576,8 @@ const getStaffJobTime = async (req, res) => {
     });
 
     jobs.sort((a, b) => {
-      if (a.isCurrentlyActive !== b.isCurrentlyActive) return a.isCurrentlyActive ? -1 : 1;
+      if (a.isCurrentlyActive !== b.isCurrentlyActive)
+        return a.isCurrentlyActive ? -1 : 1;
       return b.totalSeconds - a.totalSeconds;
     });
 
@@ -471,7 +608,11 @@ const submitTaskLog = async (req, res) => {
     if (!message?.trim()) return errorResponse(res, "message is required.");
 
     const now   = new Date();
-    const label = hour_label || now.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+    const label =
+      hour_label ||
+      now.toLocaleTimeString("en-IN", {
+        hour: "2-digit", minute: "2-digit", hour12: true,
+      });
 
     const log = await StaffTaskLog.create({
       staff_id:     staffId,
@@ -494,8 +635,8 @@ const submitTaskLog = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const deleteTaskLog = async (req, res) => {
   try {
-    const { logId } = req.params;
-    const deleted   = await StaffTaskLog.findByIdAndDelete(logId);
+    const { logId }  = req.params;
+    const deleted    = await StaffTaskLog.findByIdAndDelete(logId);
     if (!deleted) return errorResponse(res, "Log entry not found.");
     return successResponse(res, "Log deleted.");
   } catch (err) {

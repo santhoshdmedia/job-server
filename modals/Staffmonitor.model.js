@@ -12,7 +12,7 @@ const { Schema } = mongoose;
 //   date              — "YYYY-MM-DD" of the login_at (for date-based queries)
 //   login_ip          — optional: client IP at login time
 //   selfie_url        — URL of the selfie photo captured at login (optional)
-//   location          — lat/lng/accuracy captured at login (optional)
+//   location          — lat/lng/accuracy + reverse-geocoded address at login
 
 const staffSessionSchema = new Schema(
   {
@@ -48,14 +48,16 @@ const staffSessionSchema = new Schema(
       default: "",
     },
 
-    // ── NEW: Selfie captured at check-in ─────────────────────────────────
+    // ── Selfie captured at check-in ───────────────────────────────────────
     selfie_url: {
       type:    String,
       default: "",
       trim:    true,
     },
 
-    // ── NEW: GPS location at check-in ────────────────────────────────────
+    // ── GPS location at check-in ──────────────────────────────────────────
+    //    formatted_address is resolved server-side via reverse-geocoding.
+    //    Falls back to "Lat, Lng" string when geocoding is unavailable.
     location: {
       latitude: {
         type:    Number,
@@ -68,6 +70,19 @@ const staffSessionSchema = new Schema(
       accuracy: {
         type:    Number,   // metres
         default: null,
+      },
+      // Human-readable address produced by reverse geocoding at login time.
+      // Stored so the frontend never needs to geocode on the fly.
+      formatted_address: {
+        type:    String,
+        default: "",
+        trim:    true,
+      },
+      // The smallest named place returned (city / town / village)
+      place_name: {
+        type:    String,
+        default: "",
+        trim:    true,
       },
     },
   },
