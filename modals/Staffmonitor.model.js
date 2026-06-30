@@ -2,159 +2,73 @@ const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
 // ─── StaffSession ─────────────────────────────────────────────────────────────
-// Tracks every login/logout event for an admin_users document.
-//
-// FIELDS:
-//   staff_id          — ref to admin_users
-//   login_at          — when the session started (required)
-//   logout_at         — when the session ended (null = still active)
-//   duration_seconds  — computed on logout: logout_at - login_at
-//   date              — "YYYY-MM-DD" of the login_at (for date-based queries)
-//   login_ip          — optional: client IP at login time
-//   selfie_url        — URL of the selfie photo captured at login (optional)
-//   location          — lat/lng/accuracy + reverse-geocoded address at login
-
 const staffSessionSchema = new Schema(
   {
-    staff_id: {
-      type:     Schema.Types.ObjectId,
-      ref:      "admin_users",
-      required: true,
-      index:    true,
-    },
-    login_at: {
-      type:     Date,
-      required: true,
-      default:  () => new Date(),
-    },
-    logout_at: {
-      type:    Date,
-      default: null,
-    },
-    duration_seconds: {
-      type:    Number,
-      default: 0,
-    },
-    // "YYYY-MM-DD" — pre-computed for fast date-range queries
+    staff_id: { type: Schema.Types.ObjectId, ref: "admin_users", required: true, index: true },
+    login_at:  { type: Date, required: true, default: () => new Date() },
+    logout_at: { type: Date, default: null },
+    duration_seconds:  { type: Number, default: 0 },
     date: {
-      type:  String,
-      index: true,
-      default() {
-        return new Date().toISOString().slice(0, 10);
-      },
+      type: String, index: true,
+      default() { return new Date().toISOString().slice(0, 10); },
     },
-    login_ip: {
-      type:    String,
-      default: "",
-    },
-
-    // ── Selfie captured at check-in ───────────────────────────────────────
-    selfie_url: {
-      type:    String,
-      default: "",
-      trim:    true,
-    },
-
-    // ── GPS location at check-in ──────────────────────────────────────────
-    //    formatted_address is resolved server-side via reverse-geocoding.
-    //    Falls back to "Lat, Lng" string when geocoding is unavailable.
+    login_ip:   { type: String, default: "" },
+    selfie_url: { type: String, default: "", trim: true },
     location: {
-      latitude: {
-        type:    Number,
-        default: null,
-      },
-      longitude: {
-        type:    Number,
-        default: null,
-      },
-      accuracy: {
-        type:    Number,   // metres
-        default: null,
-      },
-      // Human-readable address produced by reverse geocoding at login time.
-      // Stored so the frontend never needs to geocode on the fly.
-      formatted_address: {
-        type:    String,
-        default: "",
-        trim:    true,
-      },
-      // The smallest named place returned (city / town / village)
-      place_name: {
-        type:    String,
-        default: "",
-        trim:    true,
-      },
+      latitude:          { type: Number, default: null },
+      longitude:         { type: Number, default: null },
+      accuracy:          { type: Number, default: null },
+      formatted_address: { type: String, default: "", trim: true },
+      place_name:        { type: String, default: "", trim: true },
     },
+
+    // ── Break / Lunch tracking ────────────────────────────────────────────
+    // Each element: { start, end, type: "break"|"lunch", duration_seconds }
+    breaks: [
+      {
+        type: { type: String, enum: ["break", "lunch"], default: "break" },
+        start: { type: Date, required: true },
+        end:   { type: Date, default: null },
+        duration_seconds: { type: Number, default: 0 },
+      },
+    ],
+
+    // Active break pointer — null when not on break
+    active_break: {
+      type:  { type: String, enum: ["break", "lunch"], default: null },
+      start: { type: Date, default: null },
+    },
+
+    // ── Overtime ─────────────────────────────────────────────────────────
+    // Standard working day is 8 hours (28800 seconds).
+    // OT is computed on logout: max(0, working_seconds - 28800).
+    working_seconds:   { type: Number, default: 0 }, // net = session - breaks
+    break_seconds:     { type: Number, default: 0 }, // total break time
+    overtime_seconds:  { type: Number, default: 0 }, // computed on logout
   },
-  {
-    collection: "staff_sessions",
-    timestamps: false,
-  },
+  { collection: "staff_sessions", timestamps: false },
 );
 
-// Compound index: fast lookup of all sessions for one staff member ordered by time
 staffSessionSchema.index({ staff_id: 1, login_at: -1 });
-// Find open sessions (logout_at: null)
 staffSessionSchema.index({ staff_id: 1, logout_at: 1 });
-// Dashboard: today's sessions across all staff
 staffSessionSchema.index({ date: 1, logout_at: 1 });
 
 const StaffSession =
   mongoose.models.staff_session ||
   mongoose.model("staff_session", staffSessionSchema);
 
-
 // ─── StaffTaskLog ─────────────────────────────────────────────────────────────
-// One entry per hourly update a staff member submits (or admin adds on behalf).
-//
-// FIELDS:
-//   staff_id     — who submitted
-//   message      — free-text task description
-//   job_ref      — optional job number / reference string
-//   hour_label   — human-readable time at submission, e.g. "02:30 PM"
-//   submitted_at — exact timestamp
-//   submitted_by — ObjectId of whoever pushed the entry
-//                  (same as staff_id for self-logs; super admin _id for admin-added logs)
-
 const staffTaskLogSchema = new Schema(
   {
-    staff_id: {
-      type:     Schema.Types.ObjectId,
-      ref:      "admin_users",
-      required: true,
-      index:    true,
-    },
-    message: {
-      type:     String,
-      required: true,
-      trim:     true,
-    },
-    job_ref: {
-      type:    String,
-      default: "",
-      trim:    true,
-    },
-    hour_label: {
-      type:    String,
-      default: "",
-    },
-    submitted_at: {
-      type:    Date,
-      default: () => new Date(),
-      index:   true,
-    },
-    submitted_by: {
-      type:    Schema.Types.ObjectId,
-      ref:     "admin_users",
-      default: null,
-    },
+    staff_id:     { type: Schema.Types.ObjectId, ref: "admin_users", required: true, index: true },
+    message:      { type: String, required: true, trim: true },
+    job_ref:      { type: String, default: "", trim: true },
+    hour_label:   { type: String, default: "" },
+    submitted_at: { type: Date, default: () => new Date(), index: true },
+    submitted_by: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
   },
-  {
-    collection: "staff_task_logs",
-    timestamps: false,
-  },
+  { collection: "staff_task_logs", timestamps: false },
 );
-
 staffTaskLogSchema.index({ staff_id: 1, submitted_at: -1 });
 staffTaskLogSchema.index({ submitted_at: -1 });
 
