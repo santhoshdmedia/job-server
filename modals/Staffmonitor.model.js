@@ -23,7 +23,6 @@ const staffSessionSchema = new Schema(
     },
 
     // ── Break / Lunch tracking ────────────────────────────────────────────
-    // Each element: { start, end, type: "break"|"lunch", duration_seconds }
     breaks: [
       {
         type: { type: String, enum: ["break", "lunch"], default: "break" },
@@ -32,19 +31,15 @@ const staffSessionSchema = new Schema(
         duration_seconds: { type: Number, default: 0 },
       },
     ],
-
-    // Active break pointer — null when not on break
     active_break: {
       type:  { type: String, enum: ["break", "lunch"], default: null },
       start: { type: Date, default: null },
     },
 
     // ── Overtime ─────────────────────────────────────────────────────────
-    // Standard working day is 8 hours (28800 seconds).
-    // OT is computed on logout: max(0, working_seconds - 28800).
-    working_seconds:   { type: Number, default: 0 }, // net = session - breaks
-    break_seconds:     { type: Number, default: 0 }, // total break time
-    overtime_seconds:  { type: Number, default: 0 }, // computed on logout
+    working_seconds:   { type: Number, default: 0 },
+    break_seconds:     { type: Number, default: 0 },
+    overtime_seconds:  { type: Number, default: 0 },
   },
   { collection: "staff_sessions", timestamps: false },
 );
@@ -76,4 +71,59 @@ const StaffTaskLog =
   mongoose.models.staff_task_log ||
   mongoose.model("staff_task_log", staffTaskLogSchema);
 
-module.exports = { StaffSession, StaffTaskLog };
+// ─── StaffAssignedTask ──────────────────────────────────────────────────────
+// Admin-assigned jobs, e.g. "Stock checking – 2 hours".
+// Lifecycle: pending -> in_progress -> completed
+//                                  \-> stopped (notes required) -> resume_requested -> in_progress (admin only)
+const staffAssignedTaskSchema = new Schema(
+  {
+    staff_id:    { type: Schema.Types.ObjectId, ref: "admin_users", required: true, index: true },
+    title:       { type: String, required: true, trim: true },
+    description: { type: String, default: "", trim: true },
+    estimated_hours: { type: Number, default: 0 },
+    due_at:      { type: Date, default: null },
+
+    assigned_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+    assigned_by_name: { type: String, default: "Admin" },
+    assigned_at:      { type: Date, default: () => new Date() },
+
+    status: {
+      type: String,
+      enum: ["pending", "in_progress", "stopped", "resume_requested", "completed"],
+      default: "pending",
+      index: true,
+    },
+
+    // Work sessions — each start/stop/resume pushes a new entry
+    sessions: [
+      {
+        start: { type: Date, required: true },
+        end:   { type: Date, default: null },
+        duration_seconds: { type: Number, default: 0 },
+      },
+    ],
+    total_seconds: { type: Number, default: 0 },
+
+    // Notes captured from the "stop" popup
+    stop_notes: { type: String, default: "", trim: true },
+    stop_history: [
+      {
+        notes:      { type: String, default: "", trim: true },
+        stopped_at: { type: Date, required: true },
+      },
+    ],
+    resume_requested_at: { type: Date, default: null },
+
+    started_at:   { type: Date, default: null },
+    completed_at: { type: Date, default: null },
+  },
+  { collection: "staff_assigned_tasks", timestamps: false },
+);
+staffAssignedTaskSchema.index({ staff_id: 1, status: 1 });
+staffAssignedTaskSchema.index({ status: 1, assigned_at: -1 });
+
+const StaffAssignedTask =
+  mongoose.models.staff_assigned_task ||
+  mongoose.model("staff_assigned_task", staffAssignedTaskSchema);
+
+module.exports = { StaffSession, StaffTaskLog, StaffAssignedTask };

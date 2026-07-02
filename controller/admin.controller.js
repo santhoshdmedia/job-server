@@ -96,7 +96,7 @@ const addAdmin = async (req, res) => {
 
   try {
     // Validate required fields
-    if (!email || !password || !name || !role || !phone) {
+    if (!email || !password || !name) {
       return errorResponse(res, "All fields (email, password, name, role, phone) are required.");
     }
 

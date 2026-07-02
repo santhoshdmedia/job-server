@@ -1,26 +1,19 @@
 /**
- * staffMonitor.controller.js  (enhanced with break / lunch / OT)
- *
- * Routes (mount under /api/staff-monitor):
- *
- *   POST   /session/login              recordLogin
- *   POST   /session/logout             recordLogout
- *   POST   /session/break/start        startBreak
- *   POST   /session/break/end          endBreak
- *   GET    /monitor                    getMonitorList
- *   GET    /monitor/:id/details        getStaffDetails
- *   GET    /monitor/:id/job-time       getStaffJobTime
- *   POST   /task-log                   submitTaskLog
- *   DELETE /task-log/:logId            deleteTaskLog
+ * staffMonitor.controller.js  (enhanced with break / lunch / OT / assigned tasks)
  *
  * OT RULE: Standard working day = 8 h (28 800 s).
  *   OT = max(0, working_seconds - 28800)  calculated on logout.
- *   working_seconds = session_duration - total_break_seconds
+ *
+ * ASSIGNED TASK LIFECYCLE:
+ *   pending -> start -> in_progress -> complete -> completed
+ *   in_progress -> stop (notes required) -> stopped
+ *   stopped -> request-resume -> resume_requested -> (admin) resume -> in_progress
+ *   stopped -> (admin) resume -> in_progress   [admin can bypass the request]
  */
 
 const axios = require("axios");
 const AdminUsersSchema = require("../modals/adminusers.modals");
-const { StaffSession, StaffTaskLog } = require("../modals/Staffmonitor.model");
+const { StaffSession, StaffTaskLog, StaffAssignedTask } = require("../modals/Staffmonitor.model");
 const Job = require("../modals/job.modal");
 const SiteVisit = require("../modals/visit.modal");
 const MaterialIssue = require("../modals/Material_issue.model");
@@ -104,6 +97,21 @@ const extractUserWorkFromStages = (stages = [], userId) => {
   return { stages: result, totalSeconds };
 };
 
+// ─── Assigned-task helpers ────────────────────────────────────────────────
+const computeTaskLiveSeconds = (task) => {
+  let total = task.total_seconds || 0;
+  if (task.status === "in_progress") {
+    const openSession = (task.sessions || []).find((s) => s.start && !s.end);
+    if (openSession) total += Math.max(0, Math.floor((Date.now() - new Date(openSession.start).getTime()) / 1000));
+  }
+  return total;
+};
+const serializeTask = (task) => {
+  const obj = typeof task.toObject === "function" ? task.toObject() : task;
+  const liveSeconds = computeTaskLiveSeconds(obj);
+  return { ...obj, live_seconds: liveSeconds, live_display: secsToDisplay(liveSeconds) };
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /session/login
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +123,6 @@ const recordLogin = async (req, res) => {
     if (!staff) return errorResponse(res, "Staff not found.");
 
     const now = new Date();
-    // Close ghost session
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (openSession) {
       openSession.logout_at = now;
@@ -164,7 +171,6 @@ const recordLogout = async (req, res) => {
     const now = new Date();
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (openSession) {
-      // End any active break first
       if (openSession.active_break?.start) {
         const bSecs = Math.max(0, Math.floor((now - openSession.active_break.start) / 1000));
         const lastBreak = openSession.breaks[openSession.breaks.length - 1];
@@ -215,17 +221,11 @@ const getSession = async (req, res) => {
   try {
     const { staffId } = req.params;
     if (!staffId) return errorResponse(res, "staffId is required.");
- 
-    const session = await StaffSession.findOne({
-      staff_id: staffId,
-      logout_at: null,
-    });
- 
+    const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (!session) return errorResponse(res, "No active session found.");
- 
     return successResponse(res, "Session fetched.", {
       login_at:      session.login_at,
-      active_break:  session.active_break,   // { type, start } or { type: null, start: null }
+      active_break:  session.active_break,
       break_seconds: session.break_seconds || 0,
     });
   } catch (err) {
@@ -233,7 +233,6 @@ const getSession = async (req, res) => {
     return errorResponse(res, "Failed to fetch session.");
   }
 };
- 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /session/break/end   body: { staffId }
@@ -291,6 +290,21 @@ const getMonitorList = async (req, res) => {
     const taskMap = {};
     for (const t of taskLogCounts) taskMap[t._id.toString()] = t;
 
+    // Assigned task summary per staff
+    const assignedTaskAgg = await StaffAssignedTask.aggregate([
+      { $match: { staff_id: { $in: staffIds } } },
+      { $group: {
+          _id: "$staff_id",
+          total: { $sum: 1 },
+          pending: { $sum: { $cond: [{ $eq: ["$status","pending"] }, 1, 0] } },
+          active:  { $sum: { $cond: [{ $eq: ["$status","in_progress"] }, 1, 0] } },
+          stopped: { $sum: { $cond: [{ $eq: ["$status","stopped"] }, 1, 0] } },
+          resumeRequested: { $sum: { $cond: [{ $eq: ["$status","resume_requested"] }, 1, 0] } },
+        } },
+    ]);
+    const assignedTaskMap = {};
+    for (const a of assignedTaskAgg) assignedTaskMap[a._id.toString()] = a;
+
     const assignedJobs = await Job.find({ "workflow_stages.handled_by.user_id": { $in: staffIds } })
       .select("job_no customer_name job_status current_stage workflow_stages").lean();
 
@@ -327,13 +341,13 @@ const getMonitorList = async (req, res) => {
       const sessions = sessionMap[id] || [];
       const taskInfo = taskMap[id] || { count: 0, lastAt: null };
       const js       = jobStatsMap[id] || {};
+      const at       = assignedTaskMap[id] || { total: 0, pending: 0, active: 0, stopped: 0, resumeRequested: 0 };
 
       const todaySeconds = sessions.reduce((acc, s) => {
         if (s.logout_at) return acc + (s.duration_seconds || 0);
         return acc + Math.floor((Date.now() - new Date(s.login_at).getTime()) / 1000);
       }, 0);
 
-      // Break / OT summary for today
       const breakSecondsToday  = sessions.reduce((a, s) => a + (s.break_seconds || 0), 0);
       const workingSecondsToday = sessions.reduce((acc, s) => {
         if (s.logout_at) return acc + (s.working_seconds || 0);
@@ -370,6 +384,10 @@ const getMonitorList = async (req, res) => {
           totalJobDisplayAll:   secsToDisplay(js.totalJobSecondsAll ?? 0),
           jobsAssignedTotal:    js.jobsAssignedTotal ?? 0,
         },
+        assignedTaskStats: {
+          total: at.total, pending: at.pending, active: at.active,
+          stopped: at.stopped, resumeRequested: at.resumeRequested,
+        },
       };
     });
 
@@ -396,6 +414,7 @@ const getStaffDetails = async (req, res) => {
 
     const sessions  = await StaffSession.find({ staff_id: id }).sort({ login_at: -1 }).lean();
     const taskLogs  = await StaffTaskLog.find({ staff_id: id }).sort({ submitted_at: -1 }).lean();
+    const assignedTasks = await StaffAssignedTask.find({ staff_id: id }).sort({ assigned_at: -1 }).lean();
 
     const assignedJobs = await Job.find({ "workflow_stages.handled_by.user_id": id })
       .select("job_no customer_name company_name job_status current_stage workflow_stages order_date createdAt").lean();
@@ -410,12 +429,10 @@ const getStaffDetails = async (req, res) => {
     });
     jobAssignments.sort((a, b) => a.isCurrentlyActive !== b.isCurrentlyActive ? (a.isCurrentlyActive ? -1 : 1) : b.totalSeconds - a.totalSeconds);
 
-    // Aggregate OT across all sessions
     const totalBreakSeconds    = sessions.reduce((a, s) => a + (s.break_seconds || 0), 0);
     const totalWorkingSeconds  = sessions.reduce((a, s) => a + (s.working_seconds || 0), 0);
     const totalOvertimeSeconds = sessions.reduce((a, s) => a + (s.overtime_seconds || 0), 0);
 
-    // ── Site Visits ───────────────────────────────────────────────────────────
     const assignedSiteVisits = await SiteVisit.find({
       $or: [
         { "assigned_to.user_id": id },
@@ -427,14 +444,12 @@ const getStaffDetails = async (req, res) => {
       .lean()
       .catch(() => []);
 
-    // ── Material Issues ────────────────────────────────────────────────────────
     const issuedMaterials = await MaterialIssue.find({ "issued_to.user_id": id })
       .select("issue_no job_no cart_item_name status issued_qty material return pickup_assignment outsource_vendor")
       .sort({ createdAt: -1 })
       .lean()
       .catch(() => []);
 
-    // Separate pickups by this staff member
     const allPickups = await MaterialIssue.find({ "pickup_assignment.assigned_to.user_id": id })
       .select("issue_no job_no outsource_vendor pickup_assignment")
       .sort({ "pickup_assignment.assigned_at": -1 })
@@ -457,6 +472,7 @@ const getStaffDetails = async (req, res) => {
 
     return successResponse(res, "Staff details fetched.", {
       staff, sessions, taskLogs, jobAssignments,
+      assignedTasks: assignedTasks.map(serializeTask),
       jobTimeSummary: { totalSeconds: totalJobSeconds, totalDisplay: secsToDisplay(totalJobSeconds), activeJobCount, jobCount: jobAssignments.length },
       attendanceSummary: {
         totalBreakSeconds,    breakDisplay:    secsToDisplay(totalBreakSeconds),
@@ -541,4 +557,202 @@ const deleteTaskLog = async (req, res) => {
   }
 };
 
-module.exports = { recordLogin, recordLogout, startBreak, endBreak, getMonitorList, getStaffDetails, getStaffJobTime, submitTaskLog, deleteTaskLog, getSession };
+// ═════════════════════════════════════════════════════════════════════════
+// ASSIGNED TASKS
+// ═════════════════════════════════════════════════════════════════════════
+
+// POST /assigned-task   body: { staffIds: [...], tasks: [{ title, description, estimated_hours, due_at }] }
+const assignTask = async (req, res) => {
+  try {
+    const { staffIds, tasks } = req.body;
+    if (!Array.isArray(staffIds) || !staffIds.length) return errorResponse(res, "staffIds is required.");
+    if (!Array.isArray(tasks) || !tasks.length) return errorResponse(res, "At least one task is required.");
+    if (tasks.some((t) => !t.title?.trim())) return errorResponse(res, "Every task requires a title.");
+
+    const docs = [];
+    for (const staffId of staffIds) {
+      for (const t of tasks) {
+        docs.push({
+          staff_id: staffId,
+          title: t.title.trim(),
+          description: t.description?.trim() || "",
+          estimated_hours: t.estimated_hours ? Number(t.estimated_hours) : 0,
+          due_at: t.due_at ? new Date(t.due_at) : null,
+          assigned_by: req.user?._id || null,
+          assigned_by_name: req.user?.name || "Admin",
+          status: "pending",
+        });
+      }
+    }
+    const created = await StaffAssignedTask.insertMany(docs);
+    return successResponse(res, "Task(s) assigned.", created.map(serializeTask));
+  } catch (err) {
+    console.error("[assignTask]", err);
+    return errorResponse(res, "Failed to assign task(s).");
+  }
+};
+
+// GET /assigned-task/staff/:staffId   ?status=
+const getAssignedTasksForStaff = async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { status } = req.query;
+    const filter = { staff_id: staffId };
+    if (status) filter.status = status;
+    const tasks = await StaffAssignedTask.find(filter).sort({ assigned_at: -1 }).lean();
+    return successResponse(res, "Tasks fetched.", tasks.map(serializeTask));
+  } catch (err) {
+    console.error("[getAssignedTasksForStaff]", err);
+    return errorResponse(res, "Failed to fetch tasks.");
+  }
+};
+
+// GET /assigned-task   ?status=   (admin, across all staff)
+const getAllAssignedTasks = async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    const tasks = await StaffAssignedTask.find(filter)
+      .populate("staff_id", "name email profileImg role")
+      .sort({ assigned_at: -1 })
+      .lean();
+    return successResponse(res, "Tasks fetched.", tasks.map(serializeTask));
+  } catch (err) {
+    console.error("[getAllAssignedTasks]", err);
+    return errorResponse(res, "Failed to fetch tasks.");
+  }
+};
+
+// POST /assigned-task/:taskId/start   (staff)
+const startAssignedTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const task = await StaffAssignedTask.findById(taskId);
+    if (!task) return errorResponse(res, "Task not found.");
+    if (task.status !== "pending") return errorResponse(res, `Cannot start a task that is ${task.status}.`);
+    const now = new Date();
+    task.sessions.push({ start: now, end: null, duration_seconds: 0 });
+    task.status = "in_progress";
+    task.started_at = task.started_at || now;
+    await task.save();
+    return successResponse(res, "Task started.", serializeTask(task));
+  } catch (err) {
+    console.error("[startAssignedTask]", err);
+    return errorResponse(res, "Failed to start task.");
+  }
+};
+
+// POST /assigned-task/:taskId/stop   body: { notes }   (staff) — notes required, opens popup on frontend
+const stopAssignedTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { notes } = req.body;
+    if (!notes?.trim()) return errorResponse(res, "Notes are required to stop a task.");
+    const task = await StaffAssignedTask.findById(taskId);
+    if (!task) return errorResponse(res, "Task not found.");
+    if (task.status !== "in_progress") return errorResponse(res, "Task is not in progress.");
+    const now = new Date();
+    const openSession = task.sessions[task.sessions.length - 1];
+    let secs = 0;
+    if (openSession && !openSession.end) {
+      secs = Math.max(0, Math.floor((now - openSession.start) / 1000));
+      openSession.end = now;
+      openSession.duration_seconds = secs;
+    }
+    task.total_seconds = (task.total_seconds || 0) + secs;
+    task.status = "stopped";
+    task.stop_notes = notes.trim();
+    task.stop_history.push({ notes: notes.trim(), stopped_at: now });
+    task.resume_requested_at = null;
+    await task.save();
+    return successResponse(res, "Task stopped.", serializeTask(task));
+  } catch (err) {
+    console.error("[stopAssignedTask]", err);
+    return errorResponse(res, "Failed to stop task.");
+  }
+};
+
+// POST /assigned-task/:taskId/complete   (staff)
+const completeAssignedTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const task = await StaffAssignedTask.findById(taskId);
+    if (!task) return errorResponse(res, "Task not found.");
+    if (task.status !== "in_progress") return errorResponse(res, "Only an in-progress task can be completed.");
+    const now = new Date();
+    const openSession = task.sessions[task.sessions.length - 1];
+    let secs = 0;
+    if (openSession && !openSession.end) {
+      secs = Math.max(0, Math.floor((now - openSession.start) / 1000));
+      openSession.end = now;
+      openSession.duration_seconds = secs;
+    }
+    task.total_seconds = (task.total_seconds || 0) + secs;
+    task.status = "completed";
+    task.completed_at = now;
+    await task.save();
+    return successResponse(res, "Task completed.", serializeTask(task));
+  } catch (err) {
+    console.error("[completeAssignedTask]", err);
+    return errorResponse(res, "Failed to complete task.");
+  }
+};
+
+// POST /assigned-task/:taskId/request-resume   (staff) — asks admin for permission
+const requestResumeTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const task = await StaffAssignedTask.findById(taskId);
+    if (!task) return errorResponse(res, "Task not found.");
+    if (task.status !== "stopped") return errorResponse(res, "Only a stopped task can request resume.");
+    task.status = "resume_requested";
+    task.resume_requested_at = new Date();
+    await task.save();
+    return successResponse(res, "Resume requested. Waiting for admin approval.", serializeTask(task));
+  } catch (err) {
+    console.error("[requestResumeTask]", err);
+    return errorResponse(res, "Failed to request resume.");
+  }
+};
+
+// POST /assigned-task/:taskId/resume   (super admin only)
+const resumeAssignedTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const task = await StaffAssignedTask.findById(taskId);
+    if (!task) return errorResponse(res, "Task not found.");
+    if (!["stopped", "resume_requested"].includes(task.status)) return errorResponse(res, "Task cannot be resumed from its current state.");
+    const now = new Date();
+    task.sessions.push({ start: now, end: null, duration_seconds: 0 });
+    task.status = "in_progress";
+    task.resume_requested_at = null;
+    await task.save();
+    return successResponse(res, "Task resumed.", serializeTask(task));
+  } catch (err) {
+    console.error("[resumeAssignedTask]", err);
+    return errorResponse(res, "Failed to resume task.");
+  }
+};
+
+// DELETE /assigned-task/:taskId   (super admin only)
+const deleteAssignedTask = async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const deleted = await StaffAssignedTask.findByIdAndDelete(taskId);
+    if (!deleted) return errorResponse(res, "Task not found.");
+    return successResponse(res, "Task deleted.");
+  } catch (err) {
+    console.error("[deleteAssignedTask]", err);
+    return errorResponse(res, "Failed to delete task.");
+  }
+};
+
+module.exports = {
+  recordLogin, recordLogout, startBreak, endBreak,
+  getMonitorList, getStaffDetails, getStaffJobTime,
+  submitTaskLog, deleteTaskLog, getSession,
+  assignTask, getAssignedTasksForStaff, getAllAssignedTasks,
+  startAssignedTask, stopAssignedTask, completeAssignedTask,
+  requestResumeTask, resumeAssignedTask, deleteAssignedTask,
+};
