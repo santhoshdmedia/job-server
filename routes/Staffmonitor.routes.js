@@ -3,7 +3,10 @@ const router  = express.Router();
 const {
   recordLogin, recordLogout, startBreak, endBreak,
   getMonitorList, getStaffDetails, getStaffJobTime,
-  submitTaskLog, deleteTaskLog,getSession
+  submitTaskLog, deleteTaskLog, getSession,
+  assignTask, getAssignedTasksForStaff, getAllAssignedTasks,
+  startAssignedTask, stopAssignedTask, completeAssignedTask,
+  requestResumeTask, resumeAssignedTask, deleteAssignedTask,
 } = require("../controller/Staffmonitor.controller");
 
 const requireSuperAdmin = (req, res, next) => {
@@ -27,5 +30,19 @@ router.get("/monitor/:id/job-time",  getStaffJobTime);
 // Task logs
 router.post  ("/task-log",         submitTaskLog);
 router.delete("/task-log/:logId",   deleteTaskLog);
+
+// ── Assigned Tasks (stock-checking style jobs assigned by admin) ──────────
+// Admin creates/oversees assignments
+router.post  ("/assigned-task",                        requireSuperAdmin, assignTask);
+router.get   ("/assigned-task",                         requireSuperAdmin, getAllAssignedTasks); // ?status=resume_requested etc.
+router.delete("/assigned-task/:taskId",                 requireSuperAdmin, deleteAssignedTask);
+router.post  ("/assigned-task/:taskId/resume",          requireSuperAdmin, resumeAssignedTask); // only super admin can resume a stopped task
+
+// Staff acts on their own tasks
+router.get   ("/assigned-task/staff/:staffId",          getAssignedTasksForStaff);
+router.post  ("/assigned-task/:taskId/start",            startAssignedTask);
+router.post  ("/assigned-task/:taskId/stop",             stopAssignedTask);          // body: { notes } — popup notes required
+router.post  ("/assigned-task/:taskId/complete",         completeAssignedTask);
+router.post  ("/assigned-task/:taskId/request-resume",   requestResumeTask);          // staff asks admin to resume
 
 module.exports = router;
