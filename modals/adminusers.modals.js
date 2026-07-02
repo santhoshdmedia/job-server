@@ -67,6 +67,10 @@ module.exports = model(
         type: Boolean,
         default: false,
       },
+      is_Special:{
+        type:Boolean,
+        default:false
+      }
     },
     {
       collection: "admin users",
