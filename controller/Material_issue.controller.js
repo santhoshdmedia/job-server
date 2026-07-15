@@ -433,7 +433,7 @@ exports.recordProductionCompletion = async (req, res) => {
   try {
     const { issueId } = req.params;
     const {
-      machine_name = "", ink_used = [], ink_notes = "",
+      machine_name = "", ink_used = [], ink_notes = "", machines = [],
       production_started_at = null, production_completed_at = null,
       production_duration_seconds = 0,
     } = req.body;
@@ -446,13 +446,18 @@ exports.recordProductionCompletion = async (req, res) => {
       if (!ink.color?.trim()) return resp(res, 400, false, "Each ink entry must have a color.");
       if (ink.quantity < 0)   return resp(res, 400, false, "Ink quantity cannot be negative.");
     }
+    if (!Array.isArray(machines)) return resp(res, 400, false, "machines must be an array.");
+    for (const m of machines) {
+      if (m.printing_time_mins < 0 || m.machine_run_time_mins < 0)
+        return resp(res, 400, false, "Machine times cannot be negative.");
+    }
 
-    issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, production_started_at, production_completed_at, production_duration_seconds });
+    issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, machines, production_started_at, production_completed_at, production_duration_seconds });
     await issue.save();
 
     return resp(res, 200, true, "Production metadata saved.", {
       issue_no: issue.issue_no, machine_name: issue.machine_name,
-      ink_used: issue.ink_used, production_duration_display: issue.production_duration_display,
+      ink_used: issue.ink_used, machines: issue.machines, production_duration_display: issue.production_duration_display,
     });
   } catch (err) {
     console.error("recordProductionCompletion:", err);
@@ -469,7 +474,7 @@ exports.recordReturn = async (req, res) => {
     const { issueId } = req.params;
     const {
       returned_qty, wastage_reason = "margin_trim", wastage_reason_notes = "",
-      returned_by = {}, machine_name = "", ink_used = [], ink_notes = "",
+      returned_by = {}, machine_name = "", ink_used = [], ink_notes = "", machines = [],
       production_started_at = null, production_completed_at = null,
       production_duration_seconds = 0,
     } = req.body;
@@ -490,7 +495,7 @@ exports.recordReturn = async (req, res) => {
     const alreadyHasProductionData =
       issue.machine_name || (issue.ink_used?.length > 0) || issue.production_duration_seconds > 0;
     if (!alreadyHasProductionData) {
-      issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, production_started_at, production_completed_at, production_duration_seconds });
+      issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, machines, production_started_at, production_completed_at, production_duration_seconds });
     }
 
     issue.applyReturn({ returned_qty, wastage_reason, wastage_reason_notes, returned_by });

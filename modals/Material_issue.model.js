@@ -124,6 +124,22 @@ const inkUsageSchema = new Schema(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sub-Schema: Machine Entry (per print-run machine/ink/time log)
+// ─────────────────────────────────────────────────────────────────────────────
+const machineEntrySchema = new Schema(
+  {
+    machine_id:            { type: String, default: "" },
+    machine_name:          { type: String, default: "" },
+    start_time:            { type: String, default: "" },
+    end_time:              { type: String, default: "" },
+    printing_time_mins:    { type: Number, default: 0 },
+    machine_run_time_mins: { type: Number, default: 0 },
+    notes:                 { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sub-Schema: Return Entry
 // ─────────────────────────────────────────────────────────────────────────────
 const returnSchema = new Schema(
@@ -330,6 +346,7 @@ const materialIssueSchema = new Schema(
     machine_name: { type: String, default: "" },
     ink_used:     { type: [inkUsageSchema], default: [] },
     ink_notes:    { type: String, default: "" },
+    machines:     { type: [machineEntrySchema], default: [] },
 
     production_started_at:       { type: Date, default: null },
     production_completed_at:     { type: Date, default: null },
@@ -412,6 +429,7 @@ materialIssueSchema.methods.applyProductionCompletion = function ({
   machine_name              = "",
   ink_used                  = [],
   ink_notes                 = "",
+  machines                  = [],
   production_started_at     = null,
   production_completed_at   = null,
   production_duration_seconds = 0,
@@ -419,6 +437,7 @@ materialIssueSchema.methods.applyProductionCompletion = function ({
   this.machine_name            = machine_name;
   this.ink_used                = ink_used;
   this.ink_notes               = ink_notes;
+  this.machines                = machines;
   this.production_started_at   = production_started_at  ? new Date(production_started_at)  : null;
   this.production_completed_at = production_completed_at ? new Date(production_completed_at) : new Date();
 

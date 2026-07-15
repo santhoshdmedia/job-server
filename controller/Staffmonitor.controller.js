@@ -19,7 +19,77 @@ const SiteVisit = require("../modals/visit.modal");
 const MaterialIssue = require("../modals/Material_issue.model");
 const { successResponse, errorResponse } = require("../helper/response.helper");
 
-const STANDARD_WORK_SECONDS = 8 * 3600; // 28 800
+const STANDARD_WORK_SECONDS = 10 * 3600; // 36 000
+
+// ─── Auto-logout policy ────────────────────────────────────────────────────
+// Everyone still logged in past 7 PM (IST) is automatically logged out,
+// unless a super admin has approved an after-hours permission request that
+// is still within its permitted window.
+const IST_OFFSET_MS      = 5.5 * 60 * 60 * 1000;
+const DEFAULT_PERMISSION_GRACE_MS = 2 * 3600 * 1000; // fallback: +2h if admin doesn't set a time
+
+// ⚠️ TEST MODE ⚠️
+// Set TEST_MODE = false to restore the real 7 PM (19:00 IST) cutoff.
+// While true, the cutoff is computed once at server-start as
+// "now + TEST_LOGOUT_DELAY_MINUTES" (in IST), so you can watch the sweep
+// actually fire a few minutes after boot instead of waiting until evening.
+const TEST_MODE = false;
+const TEST_LOGOUT_DELAY_MINUTES = 1;
+
+const computeAutoLogoutHour = () => {
+  if (!TEST_MODE) return 19; // real 7 PM (19:00 IST)
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const hourNow = istNow.getUTCHours() + istNow.getUTCMinutes() / 60 + istNow.getUTCSeconds() / 3600;
+  const testHour = hourNow + TEST_LOGOUT_DELAY_MINUTES / 60;
+  console.log(
+    `[staffMonitor][TEST_MODE] Auto-logout cutoff will fire in ~${TEST_LOGOUT_DELAY_MINUTES} min ` +
+    `(IST hour threshold: ${testHour.toFixed(4)})`
+  );
+  return testHour;
+};
+
+const AUTO_LOGOUT_HOUR = computeAutoLogoutHour();
+
+const toIST = (d = new Date()) => new Date(d.getTime() + IST_OFFSET_MS);
+
+// ⚠️ BUG FIX ⚠️
+// This used to compare `toIST(d).getUTCHours()` (an INTEGER hour, e.g. 14)
+// against AUTO_LOGOUT_HOUR (a fractional hour, e.g. 14.0167 for "14:01").
+// 14 >= 14.0167 is false for the ENTIRE rest of that hour — so in test mode
+// the sweep didn't fire after N minutes, it only fired whenever the clock
+// happened to roll over to the next hour. Now both sides use fractional
+// hours so a threshold like "+1 minute" actually means +1 minute.
+const isPastAutoLogoutTime = (d = new Date()) => {
+  const ist = toIST(d);
+  const hourFrac = ist.getUTCHours() + ist.getUTCMinutes() / 60 + ist.getUTCSeconds() / 3600;
+  return hourFrac >= AUTO_LOGOUT_HOUR;
+};
+
+// ─── Shared session-close helpers ──────────────────────────────────────────
+// Used by manual logout, admin force-logout, and the auto-logout sweep so
+// duration/OT/break math stays identical no matter who/what closes the session.
+const closeBreakIfAny = (session, now) => {
+  if (session.active_break?.start) {
+    const bSecs = Math.max(0, Math.floor((now - session.active_break.start) / 1000));
+    const lastBreak = session.breaks[session.breaks.length - 1];
+    if (lastBreak && !lastBreak.end) {
+      lastBreak.end = now;
+      lastBreak.duration_seconds = bSecs;
+    }
+    session.break_seconds = (session.break_seconds || 0) + bSecs;
+    session.active_break  = { type: null, start: null };
+  }
+};
+
+const finalizeSession = (session, now, extra = {}) => {
+  session.logout_at        = now;
+  session.duration_seconds = Math.max(0, Math.floor((now - session.login_at) / 1000));
+  session.working_seconds  = Math.max(0, session.duration_seconds - (session.break_seconds || 0));
+  session.overtime_seconds = Math.max(0, session.working_seconds - STANDARD_WORK_SECONDS);
+  session.logout_type      = extra.logout_type || "manual";
+  if (extra.forced_logout_by)      session.forced_logout_by      = extra.forced_logout_by;
+  if (extra.forced_logout_by_name) session.forced_logout_by_name = extra.forced_logout_by_name;
+};
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 const todayStr  = () => new Date().toISOString().slice(0, 10);
@@ -125,10 +195,11 @@ const recordLogin = async (req, res) => {
     const now = new Date();
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (openSession) {
-      openSession.logout_at = now;
-      openSession.duration_seconds = Math.max(0, Math.floor((now - openSession.login_at) / 1000));
-      openSession.working_seconds  = Math.max(0, openSession.duration_seconds - (openSession.break_seconds || 0));
-      openSession.overtime_seconds = Math.max(0, openSession.working_seconds - STANDARD_WORK_SECONDS);
+      // Staff is logging in again while an old session was still open
+      // (e.g. they closed the browser tab without logging out). Close it
+      // out cleanly rather than leaving it dangling forever.
+      closeBreakIfAny(openSession, now);
+      finalizeSession(openSession, now, { logout_type: "manual" });
       await openSession.save();
     }
 
@@ -171,20 +242,8 @@ const recordLogout = async (req, res) => {
     const now = new Date();
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (openSession) {
-      if (openSession.active_break?.start) {
-        const bSecs = Math.max(0, Math.floor((now - openSession.active_break.start) / 1000));
-        const lastBreak = openSession.breaks[openSession.breaks.length - 1];
-        if (lastBreak && !lastBreak.end) {
-          lastBreak.end = now;
-          lastBreak.duration_seconds = bSecs;
-        }
-        openSession.break_seconds = (openSession.break_seconds || 0) + bSecs;
-        openSession.active_break  = { type: null, start: null };
-      }
-      openSession.logout_at        = now;
-      openSession.duration_seconds = Math.max(0, Math.floor((now - openSession.login_at) / 1000));
-      openSession.working_seconds  = Math.max(0, openSession.duration_seconds - (openSession.break_seconds || 0));
-      openSession.overtime_seconds = Math.max(0, openSession.working_seconds - STANDARD_WORK_SECONDS);
+      closeBreakIfAny(openSession, now);
+      finalizeSession(openSession, now, { logout_type: "manual" });
       await openSession.save();
     }
     await AdminUsersSchema.findByIdAndUpdate(staffId, { isOnline: false });
@@ -193,6 +252,190 @@ const recordLogout = async (req, res) => {
   } catch (err) {
     console.error("[recordLogout]", err);
     return errorResponse(res, "Failed to record logout.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/force-logout   body: { staffId }   (super admin only)
+// Lets a super admin close out a staff member's session when they "didn't
+// log out correctly" (forgot to log out, app crashed, left it open, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+const forceLogout = async (req, res) => {
+  try {
+    const { staffId } = req.body;
+    if (!staffId) return errorResponse(res, "staffId is required.");
+
+    const now = new Date();
+    const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+
+    if (!openSession) {
+      // Nothing open in the DB, but isOnline flag might be stuck true — sync it.
+      await AdminUsersSchema.findByIdAndUpdate(staffId, { isOnline: false });
+      return errorResponse(res, "No active session found for this staff member. Their online status has been reset.");
+    }
+
+    closeBreakIfAny(openSession, now);
+    finalizeSession(openSession, now, {
+      logout_type: "forced_admin",
+      forced_logout_by: req.user?._id || null,
+      forced_logout_by_name: req.user?.name || "Super Admin",
+    });
+    // Any pending after-hours request becomes moot once they're force-logged-out.
+    if (openSession.permission?.status === "pending") {
+      openSession.permission.status = "rejected";
+      openSession.permission.responded_by = req.user?._id || null;
+      openSession.permission.responded_by_name = req.user?.name || "Super Admin";
+      openSession.permission.responded_at = now;
+      openSession.permission.response_note = "Auto-closed: staff was logged out by admin.";
+    }
+    await openSession.save();
+    await AdminUsersSchema.findByIdAndUpdate(staffId, { isOnline: false });
+
+    return successResponse(res, "Staff member has been logged out.", {
+      overtime_seconds: openSession.overtime_seconds,
+      overtime_display: secsToDisplay(openSession.overtime_seconds),
+      logout_type: openSession.logout_type,
+    });
+  } catch (err) {
+    console.error("[forceLogout]", err);
+    return errorResponse(res, "Failed to force logout.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/permission/request   body: { staffId, reason, requested_until }
+// Staff asks for permission to keep working past the 7 PM auto-logout cutoff.
+// ─────────────────────────────────────────────────────────────────────────────
+const requestPermission = async (req, res) => {
+  try {
+    const { staffId, reason, requested_until } = req.body;
+    if (!staffId)         return errorResponse(res, "staffId is required.");
+    if (!reason?.trim())  return errorResponse(res, "Please provide a reason for working after 7 PM.");
+
+    const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+    if (!session) return errorResponse(res, "No active session found. Please log in first.");
+
+    if (session.permission?.status === "pending") {
+      return errorResponse(res, "You already have a pending permission request.");
+    }
+    if (session.permission?.status === "approved" && session.permission?.permitted_until && new Date(session.permission.permitted_until) > new Date()) {
+      return errorResponse(res, "You already have approved permission to work late.");
+    }
+
+    const now = new Date();
+    session.permission = {
+      status: "pending",
+      reason: reason.trim(),
+      requested_at: now,
+      requested_until: requested_until ? new Date(requested_until) : null,
+      responded_by: null,
+      responded_by_name: "",
+      responded_at: null,
+      permitted_until: null,
+      response_note: "",
+    };
+    await session.save();
+
+    return successResponse(res, "Permission requested. Waiting for super admin approval.", { permission: session.permission });
+  } catch (err) {
+    console.error("[requestPermission]", err);
+    return errorResponse(res, "Failed to request permission.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /session/permission/pending   (super admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+const getPendingPermissions = async (req, res) => {
+  try {
+    const sessions = await StaffSession.find({ logout_at: null, "permission.status": "pending" })
+      .populate("staff_id", "name email role profileImg")
+      .sort({ "permission.requested_at": -1 })
+      .lean();
+    return successResponse(res, "Pending permission requests fetched.", sessions);
+  } catch (err) {
+    console.error("[getPendingPermissions]", err);
+    return errorResponse(res, "Failed to fetch pending permission requests.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/permission/:staffId/respond
+// body: { status: "approved"|"rejected", permitted_until?, note? }   (super admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+const respondPermission = async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { status, permitted_until, note } = req.body;
+    if (!["approved", "rejected"].includes(status)) {
+      return errorResponse(res, "status must be 'approved' or 'rejected'.");
+    }
+
+    const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+    if (!session) return errorResponse(res, "No active session found for this staff member.");
+    if (session.permission?.status !== "pending") {
+      return errorResponse(res, "There is no pending permission request for this staff member.");
+    }
+
+    const now = new Date();
+    session.permission.status             = status;
+    session.permission.responded_by       = req.user?._id || null;
+    session.permission.responded_by_name  = req.user?.name || "Super Admin";
+    session.permission.responded_at       = now;
+    session.permission.response_note      = note?.trim() || "";
+
+    if (status === "approved") {
+      session.permission.permitted_until = permitted_until
+        ? new Date(permitted_until)
+        : new Date(now.getTime() + DEFAULT_PERMISSION_GRACE_MS);
+    } else {
+      session.permission.permitted_until = null;
+    }
+    await session.save();
+
+    return successResponse(res, `Permission ${status}.`, { permission: session.permission });
+  } catch (err) {
+    console.error("[respondPermission]", err);
+    return errorResponse(res, "Failed to respond to permission request.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-logout sweep — call periodically (see index.js).
+// After 7 PM IST, anyone still logged in gets logged out automatically
+// UNLESS they have an admin-approved permission whose window hasn't expired.
+// ─────────────────────────────────────────────────────────────────────────────
+const runAutoLogoutSweep = async () => {
+  try {
+    if (!isPastAutoLogoutTime()) return { checked: 0, loggedOut: 0 };
+
+    const now = new Date();
+    const openSessions = await StaffSession.find({ logout_at: null });
+    let loggedOut = 0;
+
+    for (const session of openSessions) {
+      const perm = session.permission || {};
+      const stillPermitted =
+        perm.status === "approved" &&
+        perm.permitted_until &&
+        new Date(perm.permitted_until) > now;
+
+      if (stillPermitted) continue; // they're allowed to keep working for now
+
+      const logoutType = perm.status === "approved" ? "auto_permission_expired" : "auto_7pm";
+
+      closeBreakIfAny(session, now);
+      finalizeSession(session, now, { logout_type: logoutType });
+      await session.save();
+      await AdminUsersSchema.findByIdAndUpdate(session.staff_id, { isOnline: false });
+      loggedOut += 1;
+    }
+
+    if (loggedOut) console.log(`[runAutoLogoutSweep] Auto-logged-out ${loggedOut} staff past the 7 PM cutoff.`);
+    return { checked: openSessions.length, loggedOut };
+  } catch (err) {
+    console.error("[runAutoLogoutSweep]", err);
+    return { checked: 0, loggedOut: 0, error: true };
   }
 };
 
@@ -224,9 +467,12 @@ const getSession = async (req, res) => {
     const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
     if (!session) return errorResponse(res, "No active session found.");
     return successResponse(res, "Session fetched.", {
-      login_at:      session.login_at,
-      active_break:  session.active_break,
-      break_seconds: session.break_seconds || 0,
+      login_at:       session.login_at,
+      active_break:   session.active_break,
+      break_seconds:  session.break_seconds || 0,
+      permission:     session.permission || { status: "none" },
+      auto_logout_hour: AUTO_LOGOUT_HOUR,
+      is_past_auto_logout_time: isPastAutoLogoutTime(),
     });
   } catch (err) {
     console.error("[getSession]", err);
@@ -362,6 +608,20 @@ const getMonitorList = async (req, res) => {
       const lastLogout   = sessions.filter((s) => s.logout_at).sort((a, b) => new Date(b.logout_at) - new Date(a.logout_at))[0]?.logout_at;
       const lastActivity = taskInfo.lastAt > lastLogout ? taskInfo.lastAt : lastLogout;
 
+      // "Didn't log out correctly" — an open session that started before
+      // today (crossed midnight without anyone closing it out).
+      const staleOpenSession = !!(openSession && openSession.date !== today);
+
+      const permission = openSession?.permission?.status && openSession.permission.status !== "none"
+        ? {
+            status:           openSession.permission.status,
+            reason:           openSession.permission.reason,
+            requested_at:     openSession.permission.requested_at,
+            requested_until:  openSession.permission.requested_until,
+            permitted_until:  openSession.permission.permitted_until,
+          }
+        : null;
+
       return {
         ...staff,
         todaySeconds,
@@ -376,6 +636,8 @@ const getMonitorList = async (req, res) => {
         workingSecondsToday,
         overtimeSecondsToday,
         overtimeDisplay:       secsToDisplay(overtimeSecondsToday),
+        staleOpenSession,       // didn't log out correctly (crossed midnight still online)
+        permission,             // current after-7pm permission request/approval, if any
         jobStats: {
           activeJobs:           js.activeJobs ?? 0,
           totalJobSecondsToday: js.totalJobSecondsToday ?? 0,
@@ -755,4 +1017,7 @@ module.exports = {
   assignTask, getAssignedTasksForStaff, getAllAssignedTasks,
   startAssignedTask, stopAssignedTask, completeAssignedTask,
   requestResumeTask, resumeAssignedTask, deleteAssignedTask,
+  // Force logout / after-hours permission / auto-logout
+  forceLogout, requestPermission, getPendingPermissions,
+  respondPermission, runAutoLogoutSweep,
 };

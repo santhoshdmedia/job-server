@@ -40,6 +40,39 @@ const staffSessionSchema = new Schema(
     working_seconds:   { type: Number, default: 0 },
     break_seconds:     { type: Number, default: 0 },
     overtime_seconds:  { type: Number, default: 0 },
+
+    // ── Logout tracking ─────────────────────────────────────────────────
+    // "manual"                  -> staff clicked logout themselves
+    // "forced_admin"            -> super admin force-logged them out (e.g. they forgot to log out)
+    // "auto_7pm"                -> system auto-logout at the 7 PM cutoff (no approved permission)
+    // "auto_permission_expired" -> system auto-logout because their approved after-hours window ended
+    logout_type: {
+      type: String,
+      enum: ["manual", "forced_admin", "auto_7pm", "auto_permission_expired"],
+      default: "manual",
+    },
+    forced_logout_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+    forced_logout_by_name: { type: String, default: "" },
+
+    // ── After-7-PM work permission ────────────────────────────────────────
+    // Staff who need to keep working past the 7 PM auto-logout cutoff must
+    // request permission; a super admin approves/rejects it with an
+    // explicit "permitted_until" time. The auto-logout sweep respects it.
+    permission: {
+      status: {
+        type: String,
+        enum: ["none", "pending", "approved", "rejected"],
+        default: "none",
+      },
+      reason:           { type: String, default: "", trim: true },
+      requested_at:     { type: Date, default: null },
+      requested_until:  { type: Date, default: null }, // what the staff asked for
+      responded_by:     { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      responded_by_name:{ type: String, default: "" },
+      responded_at:     { type: Date, default: null },
+      permitted_until:  { type: Date, default: null }, // admin-approved cutoff
+      response_note:    { type: String, default: "", trim: true },
+    },
   },
   { collection: "staff_sessions", timestamps: false },
 );
@@ -47,6 +80,7 @@ const staffSessionSchema = new Schema(
 staffSessionSchema.index({ staff_id: 1, login_at: -1 });
 staffSessionSchema.index({ staff_id: 1, logout_at: 1 });
 staffSessionSchema.index({ date: 1, logout_at: 1 });
+staffSessionSchema.index({ logout_at: 1, "permission.status": 1 });
 
 const StaffSession =
   mongoose.models.staff_session ||

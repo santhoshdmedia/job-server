@@ -57,4 +57,19 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
                     require("os").networkInterfaces()["wlan0"]?.[0]?.address;
     console.log(`🚀 Server on http://${localIp || Host}:${Port}`);
   });
+
+  // ==================== STAFF AUTO-LOGOUT SWEEP ====================
+  // Every staff member still clocked in after 7 PM (IST) gets logged out
+  // automatically, unless a super admin approved an after-hours permission
+  // request that's still within its window. Checked every minute so the
+  // cutoff is enforced promptly without hammering the DB.
+  const { runAutoLogoutSweep } = require("./controller/Staffmonitor.controller");
+  const AUTO_LOGOUT_SWEEP_INTERVAL_MS = 60 * 1000;
+  setInterval(() => {
+    runAutoLogoutSweep().catch((err) => console.error("[autoLogoutSweep]", err));
+  }, AUTO_LOGOUT_SWEEP_INTERVAL_MS);
+  // Run once shortly after boot too, in case the server restarted mid-evening.
+  setTimeout(() => {
+    runAutoLogoutSweep().catch((err) => console.error("[autoLogoutSweep]", err));
+  }, 10 * 1000);
 });

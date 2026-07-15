@@ -125,5 +125,17 @@ router.post("/upload", upload.single("image"), validateFileMiddleware, async (re
 
 router.post("/:jobId/material/issue", material.issueMaterial);
 
+// GET /api/jobs/:jobId/material
+// Job-scoped material issues — used by the production panel to match each
+// cart item's design files to their issued material (cart_item_index /
+// design_file_id), mirroring the store manager's per-design-file logic.
+// This was previously implemented in the controller (getJobMaterials) but
+// never mounted, forcing the frontend to fetch the unfiltered/paginated
+// global `/material` list and filter client-side. Mounting it here fixes
+// that and gives production an accurate, job-scoped source of truth.
+router.get("/:jobId/material", material.getJobMaterials);
 
+// GET /api/jobs/:jobId/items/:itemId/material
+router.get("/:jobId/items/:itemId/material", material.getItemMaterials);
+  
 module.exports = router;
