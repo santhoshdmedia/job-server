@@ -433,38 +433,58 @@ exports.recordProductionCompletion = async (req, res) => {
   try {
     const { issueId } = req.params;
     const {
-      machine_name = "", ink_used = [], ink_notes = "", machines = [],
-      production_started_at = null, production_completed_at = null,
+      machines = [],
+      production_notes = "",
+      production_photos = [],
+      production_started_at = null,
+      production_completed_at = null,
       production_duration_seconds = 0,
     } = req.body;
 
-    if (!machine_name?.trim()) return resp(res, 400, false, "machine_name is required.");
     const issue = await MaterialIssue.findById(issueId);
     if (!issue) return resp(res, 404, false, "Material issue record not found.");
-    if (!Array.isArray(ink_used)) return resp(res, 400, false, "ink_used must be an array.");
-    for (const ink of ink_used) {
-      if (!ink.color?.trim()) return resp(res, 400, false, "Each ink entry must have a color.");
-      if (ink.quantity < 0)   return resp(res, 400, false, "Ink quantity cannot be negative.");
-    }
-    if (!Array.isArray(machines)) return resp(res, 400, false, "machines must be an array.");
+
+    if (!Array.isArray(machines) || machines.length === 0)
+      return resp(res, 400, false, "machines must be a non-empty array.");
+
     for (const m of machines) {
-      if (m.printing_time_mins < 0 || m.machine_run_time_mins < 0)
+      if (!m.machine_id?.trim())   return resp(res, 400, false, "Each machine must have a machine_id.");
+      if (!m.machine_name?.trim()) return resp(res, 400, false, "Each machine must have a machine_name.");
+      if ((m.printing_time_mins ?? 0) < 0 || (m.machine_run_time_mins ?? 0) < 0)
         return resp(res, 400, false, "Machine times cannot be negative.");
+      if (!Array.isArray(m.inks))
+        return resp(res, 400, false, `Machine "${m.machine_name}" must have an inks array.`);
+      for (const ink of m.inks) {
+        if (!ink.color?.trim())    return resp(res, 400, false, "Each ink entry must have a color.");
+        if ((ink.quantity ?? 0) < 0) return resp(res, 400, false, "Ink quantity cannot be negative.");
+      }
     }
 
-    issue.applyProductionCompletion({ machine_name, ink_used, ink_notes, machines, production_started_at, production_completed_at, production_duration_seconds });
+    if (!Array.isArray(production_photos))
+      return resp(res, 400, false, "production_photos must be an array.");
+
+    issue.applyProductionCompletion({
+      machines,
+      production_notes,
+      production_photos,
+      production_started_at,
+      production_completed_at,
+      production_duration_seconds,
+    });
     await issue.save();
 
     return resp(res, 200, true, "Production metadata saved.", {
-      issue_no: issue.issue_no, machine_name: issue.machine_name,
-      ink_used: issue.ink_used, machines: issue.machines, production_duration_display: issue.production_duration_display,
+      issue_no:                    issue.issue_no,
+      machines:                    issue.machines,
+      production_notes:            issue.production_notes,
+      production_photos:           issue.production_photos,
+      production_duration_display: issue.production_duration_display,
     });
   } catch (err) {
     console.error("recordProductionCompletion:", err);
     return resp(res, 500, false, err.message);
   }
 };
-
 // =============================================================================
 // 4. RECORD RETURN
 // POST /api/material/:issueId/return

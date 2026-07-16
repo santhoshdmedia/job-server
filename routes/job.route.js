@@ -68,6 +68,7 @@ router.delete("/:id/items/:itemId/design-files/:fileId", jobController.removeIte
 
 // Assign designer to file (initial assignment)
 router.post("/:id/approve",  jobController.approveJob);
+router.post("/:id/assign",  jobController.assignJob);
 router.patch("/:id/items/:itemId/design-files/:fileId/assign", jobController.assignDesignFile);
 router.post("/:id/items/:itemId/design-file/migrate", jobController.migrateDesignFile);
 

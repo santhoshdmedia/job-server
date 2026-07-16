@@ -58,18 +58,11 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
     console.log(`🚀 Server on http://${localIp || Host}:${Port}`);
   });
 
-  // ==================== STAFF AUTO-LOGOUT SWEEP ====================
-  // Every staff member still clocked in after 7 PM (IST) gets logged out
-  // automatically, unless a super admin approved an after-hours permission
-  // request that's still within its window. Checked every minute so the
-  // cutoff is enforced promptly without hammering the DB.
-  const { runAutoLogoutSweep } = require("./controller/Staffmonitor.controller");
-  const AUTO_LOGOUT_SWEEP_INTERVAL_MS = 60 * 1000;
-  setInterval(() => {
-    runAutoLogoutSweep().catch((err) => console.error("[autoLogoutSweep]", err));
-  }, AUTO_LOGOUT_SWEEP_INTERVAL_MS);
-  // Run once shortly after boot too, in case the server restarted mid-evening.
-  setTimeout(() => {
-    runAutoLogoutSweep().catch((err) => console.error("[autoLogoutSweep]", err));
-  }, 10 * 1000);
+  // ==================== STAFF AUTO-LOGOUT SWEEP (disabled) ====================
+  // The automatic 7 PM (IST) auto-logout has been removed. Staff attendance
+  // is now controlled entirely by the user via "In Time" / "Out Time" in the
+  // navbar (see Staffmonitor.controller.js recordLogin/recordLogout) and no
+  // longer force-closed on a schedule. The sweep function still exists in
+  // the controller (unused) in case a manual/admin-triggered sweep is ever
+  // needed again, but nothing calls it automatically anymore.
 });
