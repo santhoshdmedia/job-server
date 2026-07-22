@@ -112,6 +112,13 @@ router.post("/:id/upload_design", jobController.uploadDesign);
 
 router.get("/assigned-to/:userId", jobController.getJobsAssignedToUser);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// QUALITY CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/:id/qc/update", jobController.updateQC);
+router.post("/:id/qc/pass", jobController.passQC);
+router.post("/:id/qc/fail", jobController.failQC);
+
 
 // payment endpoints (legacy, to be refactored later)
 router.post("/:id/collect-payment", jobController.collectPayment);

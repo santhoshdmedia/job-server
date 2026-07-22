@@ -489,6 +489,96 @@ exports.assignJob = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// QUALITY CHECK
+// Used by both the dedicated Quality Check dashboard and the Super Admin
+// Job Management panel — both send the same request shape.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /:id/qc/update
+// Body: { qc_notes?, qc_images? (new photo URLs to append), handled_by? }
+// Saves inspection notes/photos without changing pass/fail status.
+exports.updateQC = async (req, res) => {
+  try {
+    const { qc_notes, qc_images, handled_by } = req.body;
+    const job = await Job.findById(req.params.id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    if (Array.isArray(qc_images) && qc_images.length) {
+      job.qc_images = [...(job.qc_images || []), ...qc_images];
+    }
+    if (typeof qc_notes === "string") {
+      job.qc_notes = qc_notes;
+    }
+    if (handled_by?.name) {
+      job.qc_inspected_by = handled_by.name;
+      job.qc_inspected_at = new Date();
+    }
+
+    await job.save();
+    return resp(res, 200, true, "QC data saved.", toPlain(job));
+  } catch (err) {
+    console.error("updateQC ❌", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// POST /:id/qc/pass
+// Body: { handled_by?: { user_id, name }, notes? }
+// Marking QC as passed also moves the job forward to the "delivery" stage —
+// this happens atomically here so it can't be skipped or left inconsistent
+// by a caller that forgets the separate status-update call.
+exports.passQC = async (req, res) => {
+  try {
+    const { handled_by, notes } = req.body;
+    const job = await Job.findById(req.params.id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    const now = new Date();
+    job.qc_status           = "passed";
+    job.qc_approved_at      = now;
+    job.qc_approved_by      = handled_by?.user_id || job.qc_approved_by;
+    job.qc_inspected_by     = handled_by?.name || job.qc_inspected_by;
+    job.qc_inspected_at     = now;
+    job.qc_rejection_reason = "";
+    if (typeof notes === "string" && notes) job.qc_notes = notes;
+
+    // ✅ QC passed → job moves on to Delivery.
+    job.job_status = "delivery";
+
+    await job.save();
+    return resp(res, 200, true, "QC passed — job moved to Delivery.", toPlain(job));
+  } catch (err) {
+    console.error("passQC ❌", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// POST /:id/qc/fail
+// Body: { handled_by?: { user_id, name }, reason (required), notes? }
+exports.failQC = async (req, res) => {
+  try {
+    const { handled_by, reason, notes } = req.body;
+    if (!reason) return resp(res, 400, false, "Rejection reason is required.");
+
+    const job = await Job.findById(req.params.id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    const now = new Date();
+    job.qc_status           = "failed";
+    job.qc_rejection_reason = reason;
+    job.qc_inspected_by     = handled_by?.name || job.qc_inspected_by;
+    job.qc_inspected_at     = now;
+    if (typeof notes === "string" && notes) job.qc_notes = notes;
+
+    await job.save();
+    return resp(res, 200, true, "QC failed — rejection recorded.", toPlain(job));
+  } catch (err) {
+    console.error("failQC ❌", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 6. ASSIGN FILE TO DESIGNER (initial assignment)
 // PATCH /api/jobs/:id/items/:itemId/design-files/:fileId/assign
 // Body: { assigned_to: { user_id?, name, role? }, handled_by?: { user_id, name, role } }
