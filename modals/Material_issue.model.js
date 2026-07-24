@@ -353,7 +353,26 @@ const materialIssueSchema = new Schema(
     production_duration_seconds: { type: Number, default: 0 },
     production_duration_display: { type: String, default: "00:00:00" },
 
+    // BUG FIX: these three fields were accepted by the controller
+    // (recordProductionCompletion) and read by the frontend
+    // (issue.production_photos / production_notes / production_status)
+    // but were never declared on the schema, so Mongoose silently
+    // stripped them on save. That made every production task look
+    // "pending" again (and lose its photos) as soon as the page
+    // reloaded / refetched from the server.
+    production_photos: { type: [String], default: [] },
+    production_notes:  { type: String,   default: "" },
+    // "pending"   — no production completion recorded yet
+    // "completed" — machines/inks/photos/notes have been saved for this task
+    production_status: {
+      type:    String,
+      enum:    ["pending", "completed"],
+      default: "pending",
+      index:   true,
+    },
+
     // ── Return ───────────────────────────────────────────────────────────────
+
     return: { type: returnSchema, default: null },
 
     // ── Status lifecycle ─────────────────────────────────────────────────────
@@ -433,6 +452,12 @@ materialIssueSchema.methods.applyProductionCompletion = function ({
   production_started_at     = null,
   production_completed_at   = null,
   production_duration_seconds = 0,
+  // BUG FIX: these two were being passed in by the controller
+  // (recordProductionCompletion) but this method never read them, so
+  // they were silently discarded even after the schema fields were
+  // added. Photos/notes must be captured here for them to ever save.
+  production_photos         = null,
+  production_notes          = null,
 }) {
   this.machine_name            = machine_name;
   this.ink_used                = ink_used;
@@ -444,6 +469,18 @@ materialIssueSchema.methods.applyProductionCompletion = function ({
   const secs = parseInt(production_duration_seconds, 10) || 0;
   this.production_duration_seconds = secs;
   this.production_duration_display = this.constructor.secsToDisplay(secs);
+
+  // Only overwrite when a value was actually supplied, so calls made from
+  // recordReturn() (which don't pass photos/notes) don't wipe out data
+  // already saved from recordProductionCompletion().
+  if (Array.isArray(production_photos)) this.production_photos = production_photos;
+  if (typeof production_notes === "string") this.production_notes = production_notes;
+
+  // BUG FIX: nothing was ever flipping this to "completed", so the
+  // frontend's `issue.production_status === "completed"` check always
+  // came back false after a refetch — tasks looked stuck on "pending"
+  // even though machines/inks/photos/notes had been saved.
+  this.production_status = "completed";
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1043,12 +1043,28 @@ exports.updateJob = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.updateJobStatus = async (req, res) => {
   try {
-    const { job_status } = req.body;
+    const { job_status, productionimg } = req.body;
     if (!job_status) return resp(res, 400, false, "job_status is required.");
+
+    const setFields = { job_status, status_updated_at: new Date() };
+
+    // BUG FIX: `productionimg` is declared on the Job schema and displayed
+    // on Myjobs.jsx / Dashboard.jsx under "Production Image" — but nothing
+    // in the app ever wrote to it. The Production Upload Panel only ever
+    // saved photos onto each *material issue* (per design file), never
+    // back onto the Job document itself, so this section never rendered
+    // for any job. Let callers optionally pass a representative photo URL
+    // here (the production panel does this when submitting to QC) so it
+    // actually gets persisted.
+    if (typeof productionimg === "string" && productionimg.trim()) {
+      setFields.productionimg          = productionimg.trim();
+      setFields.production_status      = "completed";
+      setFields.production_approved_at = new Date();
+    }
 
     const job = await Job.findByIdAndUpdate(
       req.params.id,
-      { $set: { job_status, status_updated_at: new Date() } },
+      { $set: setFields },
       { new: true },
     ).lean();
 

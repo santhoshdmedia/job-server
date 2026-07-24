@@ -356,7 +356,7 @@ const jobSchema = new Schema(
     design_is_sample:        { type: Boolean, default: false },
 
     // ── Production ─────────────────────────────────────────────────────────
-    productionimg:          { type: String, default: "" },
+    productionimg:          { type: [String], default: "" },
     production_status:      { type: String, default: "pending" },
     production_approved_at: { type: Date },
     production_approved_by: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },

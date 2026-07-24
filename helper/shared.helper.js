@@ -1,8 +1,8 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const _ = require("lodash");
-const { errorResponse, successResponse } = require("../helper/response.helper");
-const { AdminUsersSchema } = require("../controller/models_import"); // adjust path
+const { errorResponse } = require("../helper/response.helper");
+const { AdminUsersSchema } = require("../controller/models_import");
 
 const PlaintoHash = async (plain_text, hash_text) => {
   return await bcrypt.compare(plain_text, hash_text);
@@ -16,7 +16,8 @@ const GenerateToken = async (payload) => {
   return jwt.sign(payload, process.env.SECRET_KEY);
 };
 
-// ✅ Fixed authenticate middleware
+// Authenticates admin users (AdminUsersSchema).
+// Checks token validity and that the user exists and is not deactivated.
 const authenticate = async (req, res, next) => {
   try {
     const token = _.get(req, "headers.authorization", "");
@@ -32,14 +33,15 @@ const authenticate = async (req, res, next) => {
       return errorResponse(res, "Invalid token", 401);
     }
 
-    // ✅ Actually fetch the user
     const user = await AdminUsersSchema.findById(decoded.id).lean();
 
     if (!user) {
       return errorResponse(res, "User not found", 401);
     }
 
-    if (!user.isActive) {
+    // Use `available` field (the actual field in AdminUsersSchema).
+    // `isActive` does not exist — checking it would block every user.
+    if (user.available === false) {
       return errorResponse(res, "Account is deactivated", 401);
     }
 
@@ -60,6 +62,8 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+// General-purpose token verification (no DB lookup).
+// Used for routes that only need the decoded payload (req.userData).
 const VerfiyToken = async (req, res, next) => {
   try {
     const token = _.get(req, "headers.authorization", "");

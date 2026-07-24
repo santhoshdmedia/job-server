@@ -13,6 +13,7 @@ const {
   issueMaterial,
   issueForDesignFile,
   recordProductionCompletion,
+  reassignIssuedTo,
   recordReturn,
   managerReview,
   updateManagerReview,
@@ -84,6 +85,10 @@ router.get("/:issueId", getMaterialIssue);
 
 // POST /api/material/:issueId/production
 router.post("/:issueId/production", recordProductionCompletion);
+
+// POST /api/material/:issueId/reassign
+// Hand an in-house production task off to a different staff member.
+router.post("/:issueId/reassign", reassignIssuedTo);
 
 // POST /api/material/:issueId/return
 router.post("/:issueId/return", recordReturn);

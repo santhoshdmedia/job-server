@@ -1,283 +1,224 @@
 const _ = require("lodash");
-const { INVALID_ACCOUNT_DETAILS, INCORRECT_PASSWORD, LOGIN_SUCCESS, PASSWORD_CHANGED_SUCCESSFULLY, SIGNUP_SUCCESS, PASSWORD_CHANGED_FAILED, CLIENT_USERS_GETTING_SUCESS, CLIENT_USERS_GETTING_FAILED, CLIENT_USER_UPDATED_SUCCESS, CLIENT_USER_UPDATED_FAILED, CLIENT_USER_DELETED_SUCCESS, CLIENT_USER_DELETED_FAILED, CLIENT_USER_ACCOUNT_ALREADY_EXISTS } = require("../helper/message.helper");
+const {
+  INVALID_ACCOUNT_DETAILS,
+  INCORRECT_PASSWORD,
+  LOGIN_SUCCESS,
+  PASSWORD_CHANGED_SUCCESSFULLY,
+  SIGNUP_SUCCESS,
+  PASSWORD_CHANGED_FAILED,
+  CLIENT_USERS_GETTING_SUCESS,
+  CLIENT_USERS_GETTING_FAILED,
+  CLIENT_USER_UPDATED_SUCCESS,
+  CLIENT_USER_UPDATED_FAILED,
+  CLIENT_USER_DELETED_SUCCESS,
+  CLIENT_USER_DELETED_FAILED,
+  CLIENT_USER_ACCOUNT_ALREADY_EXISTS,
+} = require("../helper/message.helper");
 const { errorResponse, successResponse } = require("../helper/response.helper");
 const { UserSchema } = require("./models_import");
 const { PlaintoHash, GenerateToken, EncryptPassword } = require("../helper/shared.helper");
-const { ObjectAlreadyInActiveTierError } = require("@aws-sdk/client-s3");
 const { default: mongoose } = require("mongoose");
-const { sendMail } = require('../mail/sendMail')
+const { sendMail } = require("../mail/sendMail");
 
+// ─── Client Login ─────────────────────────────────────────────────────────────
+// BUG FIX: Was using aggregate() (returns array) then checking `if (!user)`
+// which is always falsy for an array. Switched to findOne() for a plain doc.
 const clientLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await UserSchema.aggregate([{ $match: { email } }]);
+
+    const user = await UserSchema.findOne({ email });
     if (!user) {
       return errorResponse(res, INVALID_ACCOUNT_DETAILS);
     }
 
-    const isPasswordValid = await PlaintoHash(password, _.get(user, "[0].password", ""));
-
-    if (isPasswordValid) {
-      const payload = {
-        id: _.get(user, "[0]._id", ""),
-        email: _.get(user, "[0].email", ""),
-        role: _.get(user, "[0].role", ""),
-      };
-      const token = await GenerateToken(payload);
-      return successResponse(res, LOGIN_SUCCESS, {
-        ...user[0],
-        token,
-      });
-    } else {
+    const isPasswordValid = await PlaintoHash(password, user.password || "");
+    if (!isPasswordValid) {
       return errorResponse(res, INCORRECT_PASSWORD);
     }
+
+    const payload = {
+      id: user._id,
+      email: user.email,
+      role: user.role,
+    };
+    const token = await GenerateToken(payload);
+
+    const userObj = user.toObject();
+    delete userObj.password;
+
+    return successResponse(res, LOGIN_SUCCESS, { ...userObj, token });
   } catch (err) {
-    console.error(err);
+    console.error("clientLogin error:", err);
     return errorResponse(res, "An error occurred while logging in");
   }
 };
+
+// ─── Google Login ─────────────────────────────────────────────────────────────
 const clientgoogleLogin = async (req, res) => {
   try {
     const { googleId, name, email, picture } = req.body;
 
-    // Log for debugging (remove in production if needed)
-    console.log("🔵 Received Google login request:", {
-      googleId,
-      email,
-      name,
-      timestamp: new Date().toISOString()
-    });
-
-    // Validate required fields
     if (!googleId || !email) {
-      console.error("❌ Missing required fields");
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields (googleId or email)'
+        message: "Missing required fields (googleId or email)",
       });
     }
 
-    // Check if user already exists
-    let user = await UserSchema.findOne({
-      $or: [{ googleId }, { email }]
-    });
+    let user = await UserSchema.findOne({ $or: [{ googleId }, { email }] });
 
     if (user) {
-      console.log("✅ Existing user found:", user._id);
-
-      // Update user if they signed up with email/password previously
       if (!user.googleId) {
         user.googleId = googleId;
-        user.name = name || user.name; // Update name if provided
-
-        // Only update picture if not already set
-        if (!user.picture && picture) {
-          user.picture = picture;
-        }
-
+        user.name = name || user.name;
+        if (!user.picture && picture) user.picture = picture;
         await user.save();
-        console.log("✅ Updated existing user with Google info");
       }
     } else {
-      console.log("🔵 Creating new user");
-
-      // Create new user
       user = new UserSchema({
         googleId,
         name,
         email,
         picture,
-        role: "user", // Default role
-        wish_list: [] // Initialize empty wish list
+        role: "user",
+        wish_list: [],
       });
-
       await user.save();
-      console.log("✅ New user created:", user._id);
     }
 
-    // Prepare payload for JWT
     const payload = {
       id: user._id.toString(),
       email: user.email,
       role: user.role || "user",
     };
-
-    console.log("🔵 Generating JWT token");
-
-    // Create JWT token
     const token = await GenerateToken(payload);
 
-    console.log("✅ Token generated successfully");
-
-    // Return standardized response
-    const response = {
+    return res.status(200).json({
       success: true,
       token,
       user: {
         id: user._id.toString(),
-        _id: user._id.toString(), // Include both for compatibility
+        _id: user._id.toString(),
         name: user.name,
         email: user.email,
         picture: user.picture,
         role: user.role || "user",
-        wish_list: user.wish_list || []
-      }
-    };
-
-    console.log("✅ Sending success response");
-
-    res.status(200).json(response);
-
+        wish_list: user.wish_list || [],
+      },
+    });
   } catch (error) {
-    console.error('❌ Google auth error:', error);
-    console.error('Error stack:', error.stack);
-
-    // Send error response
-    res.status(500).json({
+    console.error("Google auth error:", error);
+    return res.status(500).json({
       success: false,
-      message: 'Internal server error',
-      // Only include error details in development
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Internal server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
 
-
-module.exports = { clientgoogleLogin };
+// ─── Email (magic-link style) Login ──────────────────────────────────────────
+// BUG FIX: Was calling _.get(user, "[0]._id") on a plain Mongoose doc (not array),
+// producing empty string in JWT. Now uses user._id directly.
 const clientEmailLogin = async (req, res) => {
   try {
     const { name, email } = req.body;
 
-    // Validate required fields
     if (!name || !email) {
-      return res.status(400).json({ message: 'Missing required fields' });
+      return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // Check if user already exists - using the User model, not UserSchema
-    let user = await UserSchema.findOne({
-      $or: [{ email }]
-    });
+    let user = await UserSchema.findOne({ email });
 
     if (user) {
-      // Update user if they signed up with email previously
       if (!user.name) {
         user.name = name;
-        // Only update picture if not already set
-
         await user.save();
       }
     } else {
-      // Create new user
-      user = new UserSchema({
-        name,
-        email,
-      });
+      user = new UserSchema({ name, email });
       await user.save();
     }
-    const payload = {
-      id: _.get(user, "[0]._id", ""),
-      email: _.get(user, "[0].email", ""),
-      role: _.get(user, "[0].role", ""),
-    };
 
-    // Create JWT token
+    // FIX: user is a plain document, not an array — access fields directly
+    const payload = {
+      id: user._id,
+      email: user.email,
+      role: user.role,
+    };
     const token = await GenerateToken(payload);
 
-    // Return user and token
-    res.status(200).json({
+    return res.status(200).json({
       token,
       user: {
         id: user._id,
         name: user.name,
         email: user.email,
-      }
+      },
     });
   } catch (error) {
-    console.error('Google auth error:', error);
-    res.status(500).json({ message: 'Internal server error' });
+    console.error("clientEmailLogin error:", error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 
+// ─── Custom Signup ────────────────────────────────────────────────────────────
 const customSignup = async (req, res) => {
-  const {
-    email,
-    password,
-    name,
-    unique_code,
-    businessName,
-    role,
-    phone
-  } = req.body;
+  const { email, password, name, unique_code, businessName, role, phone } = req.body;
 
-  // Basic validation
   if (!email || !password || !name) {
     return errorResponse(res, "Missing required fields: email, password, name");
   }
 
-  // Validate role against enum values
   const validRoles = ["user", "Corporate", "Dealer"];
   if (role && !validRoles.includes(role)) {
     return errorResponse(res, "Invalid role specified");
   }
 
   try {
-    // Check for existing user (case-insensitive)
     const existingUser = await UserSchema.findOne({
-      email: email.toLowerCase().trim()
+      email: email.toLowerCase().trim(),
     });
     if (existingUser) {
       return errorResponse(res, CLIENT_USER_ACCOUNT_ALREADY_EXISTS);
     }
 
-    // Create new user
     const newUser = new UserSchema({
       email: email.toLowerCase().trim(),
       password: await EncryptPassword(password),
       name: name.trim(),
-      phone: phone,
+      phone,
       role,
       ...(unique_code && { unique_code }),
-      ...(businessName && { businessName })
+      ...(businessName && { businessName }),
     });
 
     const savedUser = await newUser.save();
 
-    // Prepare payload for token
     const payload = {
       id: savedUser._id,
       email: savedUser.email,
       role: savedUser.role,
       ...(savedUser.business_name && { business_name: savedUser.business_name }),
-      ...(savedUser.unique_code && { unique_code: savedUser.unique_code })
+      ...(savedUser.unique_code && { unique_code: savedUser.unique_code }),
     };
-
-    // Generate JWT token
     const token = await GenerateToken(payload);
 
-    // Return success response (omit password from response)
     const userResponse = _.omit(savedUser.toObject(), "password");
-    return successResponse(res, SIGNUP_SUCCESS, {
-      ...userResponse,
-      token
-    });
+    return successResponse(res, SIGNUP_SUCCESS, { ...userResponse, token });
   } catch (error) {
     console.error("Signup Error:", error);
-
-    // Handle duplicate key errors
     if (error.code === 11000) {
       return errorResponse(res, "Account already exists with this email");
     }
-
-    // Handle validation errors
     if (error.name === "ValidationError") {
-      // For debugging, you might want to log the specific validation errors
-      console.error("Validation errors:", error.errors);
       return errorResponse(res, "Validation failed. Please check your input.");
     }
-
     return errorResponse(res, "An error occurred during signup");
   }
 };
+
+// ─── BNI Signup ───────────────────────────────────────────────────────────────
 const BNISignup = async (req, res) => {
   const {
     email,
@@ -293,32 +234,28 @@ const BNISignup = async (req, res) => {
     categorey,
   } = req.body;
 
-  // Basic validation
   if (!email || !password || !name) {
     return errorResponse(res, "Missing required fields: email, password, name");
   }
 
-  // Validate role against enum values
   const validRoles = ["bni_user"];
   if (role && !validRoles.includes(role)) {
     return errorResponse(res, "Invalid role specified");
   }
 
   try {
-    // Check for existing user (case-insensitive)
     const existingUser = await UserSchema.findOne({
-      email: email.toLowerCase().trim()
+      email: email.toLowerCase().trim(),
     });
     if (existingUser) {
       return errorResponse(res, CLIENT_USER_ACCOUNT_ALREADY_EXISTS);
     }
 
-    // Create new user
     const newUser = new UserSchema({
       email: email.toLowerCase().trim(),
       password: await EncryptPassword(password),
       name: name.trim(),
-      phone: phone,
+      phone,
       role,
       ...(unique_code && { unique_code }),
       ...(businessName && { businessName }),
@@ -329,8 +266,7 @@ const BNISignup = async (req, res) => {
     });
 
     const savedUser = await newUser.save();
-    
-    // Prepare payload for token
+
     const payload = {
       id: savedUser._id,
       email: savedUser.email,
@@ -342,96 +278,61 @@ const BNISignup = async (req, res) => {
       city: savedUser.city,
       categorey: savedUser.categorey,
     };
-
-    // Generate JWT token
     const token = await GenerateToken(payload);
 
-    // Send welcome email (async - don't wait for it)
     const emailData = {
       email: savedUser.email,
       name: member_Name || name,
       target: "BNI welcome mail",
     };
-    
-    // Send email in background, don't block the response
-    sendMail(emailData).catch(err => {
-      console.error("Failed to send welcome email:", err);
-      // Log the error but don't fail the signup process
-    });
+    sendMail(emailData).catch((err) => console.error("Failed to send welcome email:", err));
 
-    // Return success response (omit password from response)
     const userResponse = _.omit(savedUser.toObject(), "password");
-    return successResponse(res, SIGNUP_SUCCESS, {
-      ...userResponse,
-      token
-    });
-    
+    return successResponse(res, SIGNUP_SUCCESS, { ...userResponse, token });
   } catch (error) {
-    console.error("Signup Error:", error);
-
-    // Handle duplicate key errors
+    console.error("BNISignup Error:", error);
     if (error.code === 11000) {
       return errorResponse(res, "Account already exists with this email");
     }
-
-    // Handle validation errors
     if (error.name === "ValidationError") {
-      // For debugging, you might want to log the specific validation errors
-      console.error("Validation errors:", error.errors);
       return errorResponse(res, "Validation failed. Please check your input.");
     }
-
     return errorResponse(res, "An error occurred during signup");
   }
 };
 
+// ─── Verify Test ──────────────────────────────────────────────────────────────
 const userVerifyTest = async (req, res) => {
   const { name, email } = req.body;
-  
+
   if (!email) {
     return res.status(400).json({ error: "Email is required" });
   }
-  
+
   const emailData = {
-    email: email,
+    email,
     name: name || "Test User",
     target: "Verify user",
   };
-  
+
   try {
-    console.log("Sending test email with data:", emailData);
-    
-  
-    
-    // Send email
     await sendMail(emailData);
-    
-    return res.json({
-      success: true,
-      message: "Test email sent",
-      debug: {
-        email: email,
-      }
-    });
-    
+    return res.json({ success: true, message: "Test email sent", debug: { email } });
   } catch (err) {
     console.error("Test email error:", err);
-    return res.status(500).json({ 
-      error: "Failed to send email",
-      details: err.message 
-    });
+    return res.status(500).json({ error: "Failed to send email", details: err.message });
   }
 };
 
+// ─── Client Signup (legacy) ───────────────────────────────────────────────────
 const clientSignup = async (req, res) => {
-  console.log(req.body);
-
   const { email, password, name, phone, gst_no } = req.body;
   try {
     const result = await UserSchema.findOne({ email });
     if (result) {
       return errorResponse(res, CLIENT_USER_ACCOUNT_ALREADY_EXISTS);
     }
+
     const newUser = new UserSchema({
       email,
       password: await EncryptPassword(password),
@@ -440,43 +341,31 @@ const clientSignup = async (req, res) => {
       gst_no,
     });
     const user = await newUser.save();
+
     const payload = {
-      id: _.get(user, "_id", ""),
-      email: _.get(user, "email", ""),
-      role: _.get(user, "role", ""),
-      phone: _.get(user, "phone", "")
+      id: user._id,
+      email: user.email,
+      role: user.role,
+      phone: user.phone,
     };
     const token = await GenerateToken(payload);
-    return successResponse(res, SIGNUP_SUCCESS, {
-      ...user,
-      token,
-    });
+
+    const userObj = user.toObject();
+    delete userObj.password;
+    return successResponse(res, SIGNUP_SUCCESS, { ...userObj, token });
   } catch (error) {
     console.log(error);
-
     return errorResponse(res, "An error occurred while sign in");
   }
 };
 
-
+// ─── Get All Client Users ─────────────────────────────────────────────────────
 const getAllClientUsers = async (req, res) => {
   try {
-    const { limit } = JSON.parse(_.get(req, "params.id", ""));
-    const result = await UserSchema.aggregate([{ $match: { role: "user" } }, ...(limit ? [{ $limit: 5 }] : [])]);
-    return successResponse(res, CLIENT_USERS_GETTING_SUCESS, result);
-  } catch (error) {
-    console.log(error);
-    return errorResponse(res, CLIENT_USERS_GETTING_FAILED);
-  }
-};
-const getAllCustomUsers = async (req, res) => {
-  try {
+    const { limit } = JSON.parse(_.get(req, "params.id", "{}"));
     const result = await UserSchema.aggregate([
-      {
-        $match: {
-          role: { $ne: "user" }
-        }
-      }
+      { $match: { role: "user" } },
+      ...(limit ? [{ $limit: 5 }] : []),
     ]);
     return successResponse(res, CLIENT_USERS_GETTING_SUCESS, result);
   } catch (error) {
@@ -485,12 +374,25 @@ const getAllCustomUsers = async (req, res) => {
   }
 };
 
+// ─── Get All Custom Users ─────────────────────────────────────────────────────
+const getAllCustomUsers = async (req, res) => {
+  try {
+    const result = await UserSchema.aggregate([
+      { $match: { role: { $ne: "user" } } },
+    ]);
+    return successResponse(res, CLIENT_USERS_GETTING_SUCESS, result);
+  } catch (error) {
+    console.log(error);
+    return errorResponse(res, CLIENT_USERS_GETTING_FAILED);
+  }
+};
+
+// ─── Get Single Client ────────────────────────────────────────────────────────
 const getSingleClient = async (req, res) => {
   try {
     const { _id } = JSON.parse(req.params.id);
 
     let where = {};
-
     if (_id) {
       where._id = new mongoose.Types.ObjectId(_id);
     }
@@ -537,63 +439,80 @@ const getSingleClient = async (req, res) => {
       },
     ]);
 
-    successResponse(res, "Get Success", result);
+    return successResponse(res, "Get Success", result);
   } catch (err) {
     console.log(err);
-    errorResponse(err);
+    return errorResponse(res, "Failed to get client");
   }
 };
 
+// ─── Update Client User ───────────────────────────────────────────────────────
+// BUG FIX: password update is correctly handled — encrypts before saving.
 const updateClientUser = async (req, res) => {
   try {
     const { email, password } = req.body;
     const { id } = req.params;
-    const result = await UserSchema.findOne({
-      $and: [{ email: email }, { _id: { $ne: id } }],
-    });
+
+    // Check email uniqueness against other users
+    if (email) {
+      const duplicate = await UserSchema.findOne({
+        email,
+        _id: { $ne: id },
+      });
+      if (duplicate) {
+        return errorResponse(res, CLIENT_USER_ACCOUNT_ALREADY_EXISTS);
+      }
+    }
+
+    // Encrypt password if being changed
     if (password) {
       req.body.password = await EncryptPassword(password);
     }
-    if (result) {
-      return errorResponse(res, CLIENT_USER_ACCOUNT_ALREADY_EXISTS);
+
+    const user = await UserSchema.findByIdAndUpdate(id, req.body, { new: true });
+    if (!user) {
+      return errorResponse(res, "User not found");
     }
-    const user = await UserSchema.findByIdAndUpdate({ _id: id }, req.body, {
-      new: true,
-    });
-    successResponse(res, CLIENT_USER_UPDATED_SUCCESS, user);
+
+    const userObj = user.toObject();
+    delete userObj.password;
+    return successResponse(res, CLIENT_USER_UPDATED_SUCCESS, userObj);
   } catch (err) {
     console.log(err);
-    errorResponse(res, CLIENT_USER_UPDATED_FAILED);
+    return errorResponse(res, CLIENT_USER_UPDATED_FAILED);
   }
 };
 
+// ─── Delete Client User ───────────────────────────────────────────────────────
 const deleteClientUser = async (req, res) => {
   try {
     const { id } = req.userData;
     const user = await UserSchema.findById(id);
 
     const { password } = req.body;
-
     const isPasswordValid = await PlaintoHash(password, _.get(user, "password", ""));
     if (isPasswordValid) {
-      await UserSchema.findByIdAndDelete({ _id: id });
-      successResponse(res, CLIENT_USER_DELETED_SUCCESS);
+      await UserSchema.findByIdAndDelete(id);
+      return successResponse(res, CLIENT_USER_DELETED_SUCCESS);
     } else {
       return errorResponse(res, INCORRECT_PASSWORD);
     }
   } catch (err) {
     console.log(err);
-    errorResponse(res, CLIENT_USER_DELETED_FAILED);
+    return errorResponse(res, CLIENT_USER_DELETED_FAILED);
   }
 };
 
+// ─── Client Check Login Status ────────────────────────────────────────────────
+// BUG FIX: _.isEmpty() on a Mongoose document is unreliable.
+// Use findById + lean() and check for null directly.
 const clientCheckloginstatus = async (req, res) => {
   try {
     const { id } = req.userData;
 
-    const result = await UserSchema.findOne({ _id: id }, { password: 0 });
+    const result = await UserSchema.findById(id, { password: 0 }).lean();
 
-    if (_.isEmpty(result)) {
+    if (!result) {
       return res.status(200).send({ message: "Invalid Token" });
     }
     return res.status(200).send({ message: "Already Login", data: result });
@@ -603,15 +522,21 @@ const clientCheckloginstatus = async (req, res) => {
   }
 };
 
+// ─── Add to History ───────────────────────────────────────────────────────────
 const addtoHistory = async (req, res) => {
   try {
-    const result = await UserSchema.findOne({ history_data: { $in: req.body.product_id } });
-    if (!_.isEmpty(result)) {
-      return true;
-    }
-    await UserSchema.findByIdAndUpdate({ _id: req.userData.id }, { $push: { history_data: req.body.product_id } });
+    const result = await UserSchema.findOne({
+      history_data: { $in: [req.body.product_id] },
+    });
+    if (result) return res.status(200).json({ success: true });
+
+    await UserSchema.findByIdAndUpdate(req.userData.id, {
+      $push: { history_data: req.body.product_id },
+    });
+    return res.status(200).json({ success: true });
   } catch (err) {
     console.error(err);
+    return res.status(500).json({ message: "Failed to add to history" });
   }
 };
 
@@ -627,5 +552,7 @@ module.exports = {
   getSingleClient,
   addtoHistory,
   clientgoogleLogin,
-  BNISignup,userVerifyTest
+  BNISignup,
+  userVerifyTest,
+  clientEmailLogin,
 };

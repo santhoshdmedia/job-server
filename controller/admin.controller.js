@@ -38,6 +38,27 @@ const AVAILABLE_PAGES = [
   { name: "Enquires",         value: "enquires" },
   { name: "Bulk Enquires",    value: "bulk-enquires" },
   { name: "Settings",         value: "settings" },
+
+  // BUG FIX: these are the job-workflow pages this app actually routes to
+  // (see frontend src/config/Router.jsx `pageName` props). They were
+  // missing from this list entirely, so they never appeared as options
+  // when a super admin tried to grant another role permission to view
+  // them — the "Production Upload Panel" (and the other operational
+  // panels) could only ever be seen by super admins, never assigned out.
+  { name: "Users / Stock",              value: "users" },
+  { name: "Admin Job Management",       value: "admin-job-management" },
+  { name: "Site Visit Dashboard",       value: "site-visit-dashboard" },
+  { name: "My Jobs",                    value: "my-jobs" },
+  { name: "Material Issue Manager",     value: "material-issue-manager" },
+  { name: "Designer Job Dashboard",     value: "admin-designer-job-dashboard" },
+  { name: "Production Upload Panel",    value: "production-panel" },
+  { name: "Quality Check Dashboard",    value: "quality-check-dashboard" },
+  { name: "Pickup Dashboard",           value: "pickup-dashboard" },
+  { name: "Delivery Panel",             value: "delivery-panel" },
+  { name: "Erection Panel",             value: "erection-panel" },
+  { name: "Staff Monitor",              value: "Staff-monitor" },
+  { name: "Staff Admin",                value: "staff-admin" },
+  { name: "My Tasks",                   value: "my-tasks" },
 ];
 
 // ─────────────────────────────────────────────
@@ -47,11 +68,13 @@ const ROLE_DEFAULT_PAGES = {
   "super admin":    null, // handled separately — full access
   "Frontend admin": ["dashboard", "BNI", "vendors"],
   "accounting team":  ["dashboard", "orders", "settings"],
-  "designing team":   ["dashboard", "orders", "settings"],
-  "production team":  ["dashboard", "orders", "settings"],
-  "quality check":    ["orders", "settings"],
+  "designing team":   ["dashboard", "orders", "settings", "admin-designer-job-dashboard", "my-jobs", "my-tasks"],
+  // BUG FIX: production team had no route to the actual Production Upload
+  // Panel in its default permissions, only unrelated e-commerce pages.
+  "production team":  ["dashboard", "orders", "settings", "production-panel", "material-issue-manager", "my-jobs", "my-tasks"],
+  "quality check":    ["orders", "settings", "quality-check-dashboard", "my-jobs", "my-tasks"],
   "packing team":     ["orders"],
-  "delivery team":    ["dashboard", "orders", "settings"],
+  "delivery team":    ["dashboard", "orders", "settings", "delivery-panel", "pickup-dashboard", "my-jobs", "my-tasks"],
   "admin":null
 };
 

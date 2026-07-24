@@ -478,6 +478,7 @@ exports.recordProductionCompletion = async (req, res) => {
       machines:                    issue.machines,
       production_notes:            issue.production_notes,
       production_photos:           issue.production_photos,
+      production_status:           issue.production_status,
       production_duration_display: issue.production_duration_display,
     });
   } catch (err) {
@@ -485,6 +486,72 @@ exports.recordProductionCompletion = async (req, res) => {
     return resp(res, 500, false, err.message);
   }
 };
+// =============================================================================
+// 3b. REASSIGN PRODUCTION TASK TO ANOTHER STAFF MEMBER
+// POST /api/material/:issueId/reassign
+//
+// Body:
+//   new_assignee { user_id, name?, role? }  — staff member taking over the task
+//   reassigned_by { user_id, name?, role? } — manager/super admin doing the reassignment (optional)
+//
+// Rules:
+//   • Only valid for in-house work (not outsource — outsource hand-offs go
+//     through assign-pickup instead).
+//   • Cannot reassign a task that's already been completed and returned.
+//   • Mirrors the change onto the parent Job's cart_item so both records
+//     stay in sync (same pattern issueMaterial uses when it first sets
+//     issued_to).
+// =============================================================================
+exports.reassignIssuedTo = async (req, res) => {
+  try {
+    const { issueId } = req.params;
+    const { new_assignee, reassigned_by = {} } = req.body;
+
+    if (!new_assignee?.user_id)
+      return resp(res, 400, false, "new_assignee.user_id is required.");
+
+    const issue = await MaterialIssue.findById(issueId);
+    if (!issue) return resp(res, 404, false, "Material issue record not found.");
+
+    if (issue.calc_mode === "outsource")
+      return resp(res, 400, false, "Outsourced tasks are reassigned via assign-pickup, not this endpoint.");
+
+    if (["returned", "no_return"].includes(issue.status))
+      return resp(res, 409, false, `${issue.issue_no} is already completed and cannot be reassigned.`);
+
+    const employee = await AdminUsers.findById(new_assignee.user_id).lean();
+    if (!employee) return resp(res, 404, false, "Selected staff member was not found.");
+
+    const previousAssignee = issue.issued_to ? { ...issue.issued_to.toObject?.() ?? issue.issued_to } : null;
+
+    const resolvedAssignee = {
+      user_id: employee._id,
+      name:    new_assignee.name || employee.name || "",
+      role:    new_assignee.role || employee.role || "",
+    };
+
+    issue.issued_to = resolvedAssignee;
+    await issue.save();
+
+    // ── Mirror onto the parent Job's cart_item so both stay in sync ──────────
+    await Job.findByIdAndUpdate(issue.job_id, {
+      $set: { [`cart_items.${issue.cart_item_index}.issued_to`]: resolvedAssignee },
+    });
+
+    return resp(res, 200, true, `Task reassigned to ${resolvedAssignee.name}.`, {
+      issue_no: issue.issue_no,
+      job_no:   issue.job_no,
+      previous_assignee: previousAssignee,
+      issued_to: resolvedAssignee,
+      reassigned_by,
+      reassigned_at: new Date(),
+    });
+  } catch (err) {
+    console.error("reassignIssuedTo:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
 // =============================================================================
 // 4. RECORD RETURN
 // POST /api/material/:issueId/return
