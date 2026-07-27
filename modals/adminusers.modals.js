@@ -70,7 +70,28 @@ module.exports = model(
       is_Special:{
         type:Boolean,
         default:false
-      }
+      },
+      // ── Staff category ──────────────────────────────────────────────────
+      // "office"    -> normal in-time/out-time attendance only.
+      // "marketing" -> additionally gets the "Field Work" flow: they can
+      // step out with an estimated-hours ETA; if they overrun it their
+      // session freezes until a super admin resumes it (or they close it
+      // themselves early if they finish on time).
+      staff_category: {
+        type: String,
+        enum: ["office", "marketing"],
+        default: "office",
+      },
+      // Set when a marketing staff's field-work ETA elapses: they're auto
+      // logged out of attendance and CANNOT do In Time again until a super
+      // admin resumes or closes it. See Staffmonitor.controller.js.
+      attendance_blocked: { type: Boolean, default: false },
+      attendance_blocked_reason: { type: String, default: "" },
+      attendance_blocked_session_id: {
+        type: Schema.Types.ObjectId,
+        ref: "staff_session",
+        default: null,
+      },
     },
     {
       collection: "admin users",

@@ -48,11 +48,56 @@ const staffSessionSchema = new Schema(
     // "auto_permission_expired" -> system auto-logout because their approved after-hours window ended
     logout_type: {
       type: String,
-      enum: ["manual", "forced_admin", "auto_7pm", "auto_permission_expired"],
+      // enum: ["manual", "forced_admin", "auto_7pm", "auto_permission_expired"],
       default: "manual",
     },
     forced_logout_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
     forced_logout_by_name: { type: String, default: "" },
+
+    // ── Field Work (marketing team: "going out" with an ETA) ───────────────
+    // Only meaningful for staff with staff_category === "marketing".
+    // Lifecycle:
+    //   none -> active                    (staff taps "Going Out", gives estimated_hours)
+    //   active -> closed                  (staff finishes on time / early -> "Back to Office")
+    //   active -> frozen                  (estimated time elapsed, nothing logged yet -> auto, lazy-checked)
+    //   frozen -> resume_requested         (staff asks admin to resume)
+    //   frozen|resume_requested -> active  (admin resumes, optionally granting more hours)
+    //   frozen|resume_requested -> closed  (admin force-closes instead of resuming)
+    field_work: {
+      status: {
+        type: String,
+        enum: ["none", "active", "frozen", "resume_requested", "closed"],
+        default: "none",
+      },
+      reason:          { type: String, default: "", trim: true },
+      estimated_hours: { type: Number, default: null },
+      started_at:      { type: Date, default: null },
+      expected_end_at: { type: Date, default: null },
+      frozen_at:       { type: Date, default: null },
+
+      resume_requested_at: { type: Date, default: null },
+      resume_reason:        { type: String, default: "", trim: true },
+
+      resumed_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      resumed_by_name: { type: String, default: "" },
+      resumed_at:      { type: Date, default: null },
+
+      closed_by:       { type: String, enum: ["staff", "admin", null], default: null },
+      closed_by_id:    { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      closed_by_name:  { type: String, default: "" },
+      closed_at:       { type: Date, default: null },
+
+      // Audit trail — one entry per start/close/freeze/resume-request/resume.
+      history: [
+        {
+          action:   { type: String, required: true }, // "started" | "closed_by_staff" | "frozen" | "resume_requested" | "resumed_by_admin" | "closed_by_admin"
+          at:       { type: Date, default: () => new Date() },
+          by_name:  { type: String, default: "" },
+          notes:    { type: String, default: "" },
+          estimated_hours: { type: Number, default: null },
+        },
+      ],
+    },
 
     // ── After-7-PM work permission ────────────────────────────────────────
     // Staff who need to keep working past the 7 PM auto-logout cutoff must
@@ -81,6 +126,7 @@ staffSessionSchema.index({ staff_id: 1, login_at: -1 });
 staffSessionSchema.index({ staff_id: 1, logout_at: 1 });
 staffSessionSchema.index({ date: 1, logout_at: 1 });
 staffSessionSchema.index({ logout_at: 1, "permission.status": 1 });
+staffSessionSchema.index({ "field_work.status": 1 });
 
 const StaffSession =
   mongoose.models.staff_session ||

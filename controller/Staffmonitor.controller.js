@@ -91,6 +91,40 @@ const finalizeSession = (session, now, extra = {}) => {
   if (extra.forced_logout_by_name) session.forced_logout_by_name = extra.forced_logout_by_name;
 };
 
+// ─── Field Work (marketing "going out with an ETA") ────────────────────────
+// There's no background cron in this app anymore (the 7 PM sweep was
+// disabled — see index.js), so instead of relying on a scheduled job, we
+// lazily check-and-flip "active" -> "frozen" any time a field-work session
+// is read or acted upon (getSession, getMonitorList, and every field-work
+// endpoint call this first). This mirrors how the old auto-logout sweep
+// worked, just computed on read instead of on a timer.
+// This is a REAL auto-logout, not just a UI badge: it finalizes the whole
+// attendance session (same math as manual logout / admin force-logout) and
+// flags the staff record so `recordLogin` (In Time) refuses to let them back
+// in until a super admin calls resumeFieldWork or closeFieldWork.
+const syncFieldWorkFreeze = async (session, staffId, now = new Date()) => {
+  const fw = session.field_work;
+  if (!fw || fw.status !== "active" || !fw.expected_end_at) return false;
+  if (new Date(fw.expected_end_at) > now) return false;
+
+  fw.status    = "frozen";
+  fw.frozen_at = now;
+  fw.history.push({ action: "frozen", at: now, by_name: "system", notes: "Estimated time elapsed — auto logged out." });
+
+  closeBreakIfAny(session, now);
+  finalizeSession(session, now, { logout_type: "auto_field_work_freeze" });
+
+  const sid = staffId || session.staff_id;
+  await AdminUsersSchema.findByIdAndUpdate(sid, {
+    isOnline: false,
+    attendance_blocked: true,
+    attendance_blocked_reason: "Field-work estimated time elapsed. Waiting for admin to resume or close it.",
+    attendance_blocked_session_id: session._id,
+  });
+
+  return true; // caller should still session.save()
+};
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 const todayStr  = () => new Date().toISOString().slice(0, 10);
 const secsToDisplay = (total) => {
@@ -189,8 +223,16 @@ const recordLogin = async (req, res) => {
   try {
     const { staffId, selfie_url, latitude, longitude, accuracy } = req.body;
     if (!staffId) return errorResponse(res, "staffId is required.");
-    const staff = await AdminUsersSchema.findById(staffId).select("name role isOnline").lean();
+    const staff = await AdminUsersSchema.findById(staffId).select("name role isOnline attendance_blocked attendance_blocked_reason").lean();
     if (!staff) return errorResponse(res, "Staff not found.");
+
+    if (staff.attendance_blocked) {
+      return errorResponse(
+        res,
+        staff.attendance_blocked_reason ||
+          "Your last field-work window froze and needs a super admin to resume or close it before you can log back in."
+      );
+    }
 
     const now = new Date();
     const openSession = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
@@ -401,6 +443,288 @@ const respondPermission = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /session/field-work/start   body: { staffId, estimated_hours, reason }
+// Marketing staff only. Starts an "out for field work" window.
+// ─────────────────────────────────────────────────────────────────────────────
+const startFieldWork = async (req, res) => {
+  try {
+    const { staffId, estimated_hours, reason } = req.body;
+    if (!staffId) return errorResponse(res, "staffId is required.");
+    const hours = Number(estimated_hours);
+    if (!hours || hours <= 0) return errorResponse(res, "Please provide a valid estimated_hours (> 0).");
+
+    const staff = await AdminUsersSchema.findById(staffId).select("staff_category name");
+    if (!staff) return errorResponse(res, "Staff not found.");
+    if (staff.staff_category !== "marketing") {
+      return errorResponse(res, "Field work is only available for marketing team staff.");
+    }
+
+    const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+    if (!session) return errorResponse(res, "No active attendance session. Please do In Time first.");
+
+    if (["active", "frozen", "resume_requested"].includes(session.field_work?.status)) {
+      return errorResponse(res, "You already have an open field-work window.");
+    }
+
+    const now = new Date();
+    const expected_end_at = new Date(now.getTime() + hours * 3600 * 1000);
+
+    session.field_work = {
+      status: "active",
+      reason: reason?.trim() || "",
+      estimated_hours: hours,
+      started_at: now,
+      expected_end_at,
+      frozen_at: null,
+      resume_requested_at: null,
+      resume_reason: "",
+      resumed_by: null,
+      resumed_by_name: "",
+      resumed_at: null,
+      closed_by: null,
+      closed_by_id: null,
+      closed_by_name: "",
+      closed_at: null,
+      history: [
+        { action: "started", at: now, by_name: staff.name, notes: reason?.trim() || "", estimated_hours: hours },
+      ],
+    };
+    await session.save();
+
+    return successResponse(res, "Field work started. Have a safe trip!", { field_work: session.field_work });
+  } catch (err) {
+    console.error("[startFieldWork]", err);
+    return errorResponse(res, "Failed to start field work.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/field-work/finish   body: { staffId }
+// Staff-initiated — "I'm back / done early", only while still "active"
+// (i.e. before the estimated time has elapsed). Once frozen, only an admin
+// can resume or close it — see resumeFieldWork / closeFieldWork below.
+// ─────────────────────────────────────────────────────────────────────────────
+const finishFieldWork = async (req, res) => {
+  try {
+    const { staffId } = req.body;
+    if (!staffId) return errorResponse(res, "staffId is required.");
+
+    const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+    if (!session) return errorResponse(res, "No active field-work window found — it may have already frozen. Check your attendance status.");
+
+    const now = new Date();
+    await syncFieldWorkFreeze(session, staffId, now);
+
+    if (session.field_work?.status !== "active") {
+      return errorResponse(res, "There's no active field-work window to close. It's already frozen — request an admin resume instead.");
+    }
+
+    session.field_work.status         = "closed";
+    session.field_work.closed_by      = "staff";
+    session.field_work.closed_by_id   = staffId;
+    session.field_work.closed_by_name = req.user?.name || "";
+    session.field_work.closed_at      = now;
+    session.field_work.history.push({ action: "closed_by_staff", at: now, by_name: req.user?.name || "" });
+    await session.save();
+
+    return successResponse(res, "Welcome back! Field work closed.", { field_work: session.field_work });
+  } catch (err) {
+    console.error("[finishFieldWork]", err);
+    return errorResponse(res, "Failed to close field work.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/field-work/resume-request   body: { staffId, reason }
+// Staff asks a super admin to resume a frozen field-work window. Note: by
+// the time this fires the underlying attendance session has already been
+// auto-logged-out (see syncFieldWorkFreeze), so we look it up via the block
+// record on the staff account rather than requiring an open session.
+// ─────────────────────────────────────────────────────────────────────────────
+const requestFieldWorkResume = async (req, res) => {
+  try {
+    const { staffId, reason } = req.body;
+    if (!staffId) return errorResponse(res, "staffId is required.");
+
+    const staff = await AdminUsersSchema.findById(staffId).select("attendance_blocked attendance_blocked_session_id");
+    if (!staff?.attendance_blocked_session_id) {
+      return errorResponse(res, "There's no frozen field-work window on file for you.");
+    }
+
+    const session = await StaffSession.findById(staff.attendance_blocked_session_id);
+    if (!session) return errorResponse(res, "Couldn't find that field-work session.");
+
+    const now = new Date();
+
+    if (session.field_work?.status === "resume_requested") {
+      return errorResponse(res, "You've already asked admin to resume — waiting for a response.");
+    }
+    if (session.field_work?.status !== "frozen") {
+      return errorResponse(res, "Your field-work time hasn't frozen yet.");
+    }
+
+    session.field_work.status               = "resume_requested";
+    session.field_work.resume_requested_at  = now;
+    session.field_work.resume_reason        = reason?.trim() || "";
+    session.field_work.history.push({ action: "resume_requested", at: now, by_name: req.user?.name || "", notes: reason?.trim() || "" });
+    await session.save();
+
+    return successResponse(res, "Resume request sent to admin.", { field_work: session.field_work });
+  } catch (err) {
+    console.error("[requestFieldWorkResume]", err);
+    return errorResponse(res, "Failed to request resume.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /session/field-work/pending   (super admin only)
+// Queue of staff who are frozen or have asked to be resumed. These sessions
+// are usually already logged out (auto-closed on freeze), so we deliberately
+// don't filter by logout_at here — only by field_work.status.
+// ─────────────────────────────────────────────────────────────────────────────
+const getFieldWorkQueue = async (req, res) => {
+  try {
+    const now = new Date();
+    const sessions = await StaffSession.find({
+      "field_work.status": { $in: ["active", "frozen", "resume_requested"] },
+    }).populate("staff_id", "name email role profileImg staff_category");
+
+    for (const session of sessions) {
+      if (await syncFieldWorkFreeze(session, session.staff_id?._id, now)) await session.save();
+    }
+
+    const queue = sessions
+      .filter((s) => ["frozen", "resume_requested"].includes(s.field_work.status))
+      .map((s) => s.toObject());
+
+    return successResponse(res, "Field work queue fetched.", queue);
+  } catch (err) {
+    console.error("[getFieldWorkQueue]", err);
+    return errorResponse(res, "Failed to fetch field work queue.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/field-work/:staffId/resume   (super admin only)
+// body: { additional_hours? }  — extends the ETA from now; omit to just
+// resume with no fixed re-freeze (estimated_hours/expected_end_at cleared).
+// Re-opens the auto-closed session (clears logout_at) and lifts the login
+// block, so the staff member doesn't have to tap "In Time" again — their
+// day just continues.
+// ─────────────────────────────────────────────────────────────────────────────
+const resumeFieldWork = async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { additional_hours, note } = req.body;
+
+    const staff = await AdminUsersSchema.findById(staffId).select("name attendance_blocked_session_id");
+    if (!staff) return errorResponse(res, "Staff not found.");
+
+    // Session may already be auto-logged-out (logout_at set) by the freeze —
+    // look it up by id rather than requiring an open session.
+    const session = staff.attendance_blocked_session_id
+      ? await StaffSession.findById(staff.attendance_blocked_session_id)
+      : await StaffSession.findOne({ staff_id: staffId }).sort({ login_at: -1 });
+    if (!session) return errorResponse(res, "No field-work session found for this staff member.");
+    if (!["frozen", "resume_requested"].includes(session.field_work?.status)) {
+      return errorResponse(res, "This staff member's field work isn't frozen / awaiting resume.");
+    }
+
+    const now = new Date();
+    const hours = Number(additional_hours);
+
+    // Re-open the session — clear the auto-logout so their day continues
+    // without needing a fresh In Time.
+    session.logout_at        = null;
+    session.duration_seconds = undefined;
+    session.working_seconds  = undefined;
+    session.overtime_seconds = undefined;
+    session.logout_type      = undefined;
+
+    session.field_work.status          = "active";
+    session.field_work.frozen_at       = null;
+    session.field_work.resumed_by      = req.user?._id || null;
+    session.field_work.resumed_by_name = req.user?.name || "Super Admin";
+    session.field_work.resumed_at      = now;
+    session.field_work.started_at      = now;
+    if (hours > 0) {
+      session.field_work.estimated_hours = hours;
+      session.field_work.expected_end_at = new Date(now.getTime() + hours * 3600 * 1000);
+    } else {
+      session.field_work.estimated_hours = null;
+      session.field_work.expected_end_at = null;
+    }
+    session.field_work.history.push({
+      action: "resumed_by_admin", at: now, by_name: req.user?.name || "Super Admin",
+      notes: note?.trim() || "", estimated_hours: hours > 0 ? hours : null,
+    });
+    await session.save();
+
+    await AdminUsersSchema.findByIdAndUpdate(staffId, {
+      isOnline: true,
+      attendance_blocked: false,
+      attendance_blocked_reason: "",
+      attendance_blocked_session_id: null,
+    });
+
+    return successResponse(res, "Field work resumed — staff can continue without re-logging in.", { field_work: session.field_work });
+  } catch (err) {
+    console.error("[resumeFieldWork]", err);
+    return errorResponse(res, "Failed to resume field work.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/field-work/:staffId/close   (super admin only)
+// Admin force-closes a frozen/resume-requested field-work window instead of
+// resuming it (e.g. the staff isn't actually coming back today). This lifts
+// the login block too — they can tap "In Time" fresh whenever they're back,
+// they just don't get the old session reopened.
+// ─────────────────────────────────────────────────────────────────────────────
+const closeFieldWork = async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { note } = req.body;
+
+    const staff = await AdminUsersSchema.findById(staffId).select("attendance_blocked_session_id");
+    if (!staff) return errorResponse(res, "Staff not found.");
+
+    const session = staff.attendance_blocked_session_id
+      ? await StaffSession.findById(staff.attendance_blocked_session_id)
+      : await StaffSession.findOne({ staff_id: staffId, logout_at: null });
+    if (!session) return errorResponse(res, "No field-work session found for this staff member.");
+    if (!["active", "frozen", "resume_requested"].includes(session.field_work?.status)) {
+      return errorResponse(res, "There's no open field-work window for this staff member.");
+    }
+
+    const now = new Date();
+    if (session.field_work.status === "active") {
+      closeBreakIfAny(session, now);
+      finalizeSession(session, now, { logout_type: "auto_field_work_freeze" });
+    }
+    session.field_work.status         = "closed";
+    session.field_work.closed_by      = "admin";
+    session.field_work.closed_by_id   = req.user?._id || null;
+    session.field_work.closed_by_name = req.user?.name || "Super Admin";
+    session.field_work.closed_at      = now;
+    session.field_work.history.push({ action: "closed_by_admin", at: now, by_name: req.user?.name || "Super Admin", notes: note?.trim() || "" });
+    await session.save();
+
+    await AdminUsersSchema.findByIdAndUpdate(staffId, {
+      isOnline: false,
+      attendance_blocked: false,
+      attendance_blocked_reason: "",
+      attendance_blocked_session_id: null,
+    });
+
+    return successResponse(res, "Field work closed by admin.", { field_work: session.field_work });
+  } catch (err) {
+    console.error("[closeFieldWork]", err);
+    return errorResponse(res, "Failed to close field work.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Auto-logout sweep — call periodically (see index.js).
 // After 7 PM IST, anyone still logged in gets logged out automatically
 // UNLESS they have an admin-approved permission whose window hasn't expired.
@@ -464,13 +788,44 @@ const getSession = async (req, res) => {
   try {
     const { staffId } = req.params;
     if (!staffId) return errorResponse(res, "staffId is required.");
+
     const session = await StaffSession.findOne({ staff_id: staffId, logout_at: null });
-    if (!session) return errorResponse(res, "No active session found.");
+
+    if (!session) {
+      // No open session — but if a field-work freeze auto-logged them out,
+      // surface that instead of a plain "not clocked in" so the UI can show
+      // the frozen/blocked state and NOT the "click In Time" button.
+      const staff = await AdminUsersSchema.findById(staffId).select("attendance_blocked attendance_blocked_reason attendance_blocked_session_id");
+      if (staff?.attendance_blocked) {
+        const blockedSession = staff.attendance_blocked_session_id
+          ? await StaffSession.findById(staff.attendance_blocked_session_id).select("field_work")
+          : null;
+        return successResponse(res, "Session fetched.", {
+          login_at: null,
+          blocked: true,
+          blocked_reason: staff.attendance_blocked_reason || "",
+          field_work: blockedSession?.field_work || { status: "frozen" },
+          auto_logout_hour: AUTO_LOGOUT_HOUR,
+          is_past_auto_logout_time: isPastAutoLogoutTime(),
+        });
+      }
+      return errorResponse(res, "No active session found.");
+    }
+
+    if (await syncFieldWorkFreeze(session, staffId)) await session.save();
+
+    // If it just froze (or already had), this session is now closed too —
+    // report it the same "blocked" way so the caller doesn't have to guess.
+    const blocked = ["frozen", "resume_requested"].includes(session.field_work?.status);
+
     return successResponse(res, "Session fetched.", {
-      login_at:       session.login_at,
+      login_at:       blocked ? null : session.login_at,
+      blocked,
+      blocked_reason: blocked ? "Field-work estimated time elapsed. Waiting for admin to resume or close it." : "",
       active_break:   session.active_break,
       break_seconds:  session.break_seconds || 0,
       permission:     session.permission || { status: "none" },
+      field_work:     session.field_work || { status: "none" },
       auto_logout_hour: AUTO_LOGOUT_HOUR,
       is_past_auto_logout_time: isPastAutoLogoutTime(),
     });
@@ -513,7 +868,7 @@ const endBreak = async (req, res) => {
 const getMonitorList = async (req, res) => {
   try {
     const today     = todayStr();
-    const staffList = await AdminUsersSchema.find({}, { name:1, email:1, role:1, profileImg:1, isOnline:1, available:1 }).lean();
+    const staffList = await AdminUsersSchema.find({}, { name:1, email:1, role:1, profileImg:1, isOnline:1, available:1, staff_category:1, attendance_blocked:1, attendance_blocked_reason:1 }).lean();
     const staffIds  = staffList.map((s) => s._id);
     const staffIdStrs = staffIds.map((id) => id.toString());
 
@@ -622,6 +977,23 @@ const getMonitorList = async (req, res) => {
           }
         : null;
 
+      const fieldWorkRaw = openSession?.field_work;
+      if (fieldWorkRaw && fieldWorkRaw.status === "active" && fieldWorkRaw.expected_end_at && new Date(fieldWorkRaw.expected_end_at) <= new Date()) {
+        // Read-only view — reflect the frozen state without writing here;
+        // the write happens lazily in getSession/getFieldWorkQueue/etc.
+        fieldWorkRaw.status = "frozen";
+      }
+      const fieldWork = fieldWorkRaw && fieldWorkRaw.status !== "none"
+        ? {
+            status:           fieldWorkRaw.status,
+            reason:           fieldWorkRaw.reason,
+            estimated_hours:  fieldWorkRaw.estimated_hours,
+            started_at:       fieldWorkRaw.started_at,
+            expected_end_at:  fieldWorkRaw.expected_end_at,
+            resume_reason:    fieldWorkRaw.resume_reason,
+          }
+        : null;
+
       return {
         ...staff,
         todaySeconds,
@@ -638,6 +1010,7 @@ const getMonitorList = async (req, res) => {
         overtimeDisplay:       secsToDisplay(overtimeSecondsToday),
         staleOpenSession,       // didn't log out correctly (crossed midnight still online)
         permission,             // current after-7pm permission request/approval, if any
+        fieldWork,              // current field-work window (marketing "going out"), if any
         jobStats: {
           activeJobs:           js.activeJobs ?? 0,
           totalJobSecondsToday: js.totalJobSecondsToday ?? 0,
@@ -1020,4 +1393,7 @@ module.exports = {
   // Force logout / after-hours permission / auto-logout
   forceLogout, requestPermission, getPendingPermissions,
   respondPermission, runAutoLogoutSweep,
+  // Field work (marketing "going out" with ETA)
+  startFieldWork, finishFieldWork, requestFieldWorkResume,
+  resumeFieldWork, closeFieldWork, getFieldWorkQueue,
 };

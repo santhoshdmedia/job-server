@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 const Job = require("../modals/job.modal");
 const AdminUsers = require("../modals/adminusers.modals");
+const MaterialIssue = require("../modals/Material_issue.model");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Response Formatter
@@ -338,6 +339,7 @@ exports.addItemDesignFiles = async (req, res) => {
 exports.removeItemDesignFile = async (req, res) => {
   try {
     const { id, itemId, fileId } = req.params;
+    const { force } = req.query;
 
     const job = await Job.findById(id);
     if (!job) return resp(res, 404, false, "Job not found.");
@@ -347,6 +349,34 @@ exports.removeItemDesignFile = async (req, res) => {
       job.cart_items.find((i) => i._id.toString() === itemId) ||
       null;
     if (!item) return resp(res, 404, false, "Cart item not found.");
+
+    // BUG FIX: this used to delete the design file unconditionally, with no
+    // check for whether material had already been issued (or outsourced)
+    // against it. That silently orphaned the MaterialIssue record — it kept
+    // existing in the database with all its real production/outsource
+    // history, but since nothing matches design_file_id to a design file
+    // that no longer exists, it became invisible everywhere in the UI
+    // (Production Panel, Pickup Dashboard summaries, etc.) and the job
+    // looked like it had never had material issued at all, even for
+    // items that were already fully produced or delivered by a vendor.
+    const linkedIssue = await MaterialIssue.findOne({
+      job_id: id,
+      design_file_id: fileId,
+      is_deleted: false,
+    }).lean();
+
+    if (linkedIssue && force !== "true") {
+      return resp(
+        res,
+        409,
+        false,
+        `Can't delete this file — material was already issued against it ` +
+        `(${linkedIssue.issue_no}${linkedIssue.calc_mode === "outsource" ? ", outsourced" : ""}, ` +
+        `status: ${linkedIssue.pickup_assignment?.status || linkedIssue.status}). ` +
+        `Return/cancel that material issue first, or pass ?force=true to delete anyway ` +
+        `and keep the history as an orphaned record.`,
+      );
+    }
 
     const before = item.design_files.length;
     item.design_files = item.design_files.filter(

@@ -8,6 +8,8 @@ const {
   startAssignedTask, stopAssignedTask, completeAssignedTask,
   requestResumeTask, resumeAssignedTask, deleteAssignedTask,
   forceLogout, requestPermission, getPendingPermissions, respondPermission,
+  startFieldWork, finishFieldWork, requestFieldWorkResume,
+  resumeFieldWork, closeFieldWork, getFieldWorkQueue,
 } = require("../controller/Staffmonitor.controller");
 const { VerfiyToken } = require("../helper/shared.helper");
 const AdminUsersSchema = require("../modals/adminusers.modals");
@@ -53,6 +55,17 @@ router.post("/session/force-logout", requireSuperAdmin, forceLogout);
 router.post("/session/permission/request",            requestPermission);         // staff asks to keep working late
 router.get ("/session/permission/pending",             requireSuperAdmin, getPendingPermissions); // admin sees queue
 router.post("/session/permission/:staffId/respond",    requireSuperAdmin, respondPermission);      // admin approves/rejects
+
+// ── Field Work — marketing team "going out" with an estimated-hours ETA ───
+// Staff-initiated: start / finish-early / request-resume-when-frozen.
+router.post("/session/field-work/start",           startFieldWork);
+router.post("/session/field-work/finish",          finishFieldWork);
+router.post("/session/field-work/resume-request",  requestFieldWorkResume);
+// Admin-only: see who's frozen/waiting, resume them (optionally granting
+// more hours), or force-close their window instead.
+router.get ("/session/field-work/pending",          requireSuperAdmin, getFieldWorkQueue);
+router.post("/session/field-work/:staffId/resume",  requireSuperAdmin, resumeFieldWork);
+router.post("/session/field-work/:staffId/close",   requireSuperAdmin, closeFieldWork);
 
 // Monitor — admin dashboard
 router.get("/monitor",               getMonitorList);

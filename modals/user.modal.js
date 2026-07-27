@@ -106,7 +106,7 @@ const userSchema = new mongoose.Schema(
     },
     verified_by: {
       type: mongoose.Schema.Types.ObjectId,
-        ref: 'admin users'
+        ref: 'admin_users'
     },
     Dealer_verification: {
       type: Boolean,

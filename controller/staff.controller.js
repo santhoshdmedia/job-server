@@ -15,11 +15,26 @@ const getAllStaff = async (req, res) => {
 
     if (role)      where.role      = role;
     if (available !== undefined) where.available = available === "true";
-    if (search)    where.$or = [
-      { name:  { $regex: search, $options: "i" } },
-      { email: { $regex: search, $options: "i" } },
-      { phone: { $regex: String(search), $options: "i" } },
-    ];
+
+    if (search && search.trim()) {
+      const s = search.trim();
+      const escaped = s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // escape regex special chars
+
+      const orConditions = [
+        { name:  { $regex: escaped, $options: "i" } },
+        { email: { $regex: escaped, $options: "i" } },
+      ];
+
+      // phone is a Number field — Mongo can't run $regex against numbers,
+      // which is what threw "Can't use $options with Number". Only add a
+      // phone match when the search term is itself numeric, and match it
+      // as an actual number instead of a regex.
+      if (/^\d+$/.test(s)) {
+        orConditions.push({ phone: Number(s) });
+      }
+
+      where.$or = orConditions;
+    }
 
     const staff = await AdminUser.find(where).select("-password").lean();
     return ok(res, staff);
@@ -46,7 +61,7 @@ const getSingleStaff = async (req, res) => {
 // POST /api/staff
 const createStaff = async (req, res) => {
   try {
-    const { name, email, phone, password, role, profileImg, pagePermissions } = req.body;
+    const { name, email, phone, password, role, profileImg, pagePermissions, staff_category } = req.body;
 
     if (!name || !email || !phone || !password || !role)
       return err(res, "name, email, phone, password and role are required", 400);
@@ -64,6 +79,7 @@ const createStaff = async (req, res) => {
       role,
       profileImg: profileImg || "",
       pagePermissions: pagePermissions || [],
+      staff_category: staff_category === "marketing" ? "marketing" : "office",
     });
 
     const result = staff.toObject();

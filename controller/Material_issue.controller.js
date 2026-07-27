@@ -441,45 +441,83 @@ exports.recordProductionCompletion = async (req, res) => {
       production_duration_seconds = 0,
     } = req.body;
 
-    const issue = await MaterialIssue.findById(issueId);
-    if (!issue) return resp(res, 404, false, "Material issue record not found.");
-
-    if (!Array.isArray(machines) || machines.length === 0)
-      return resp(res, 400, false, "machines must be a non-empty array.");
-
-    for (const m of machines) {
-      if (!m.machine_id?.trim())   return resp(res, 400, false, "Each machine must have a machine_id.");
-      if (!m.machine_name?.trim()) return resp(res, 400, false, "Each machine must have a machine_name.");
-      if ((m.printing_time_mins ?? 0) < 0 || (m.machine_run_time_mins ?? 0) < 0)
-        return resp(res, 400, false, "Machine times cannot be negative.");
-      if (!Array.isArray(m.inks))
-        return resp(res, 400, false, `Machine "${m.machine_name}" must have an inks array.`);
-      for (const ink of m.inks) {
-        if (!ink.color?.trim())    return resp(res, 400, false, "Each ink entry must have a color.");
-        if ((ink.quantity ?? 0) < 0) return resp(res, 400, false, "Ink quantity cannot be negative.");
-      }
-    }
+    if (!mongoose.Types.ObjectId.isValid(issueId))
+      return resp(res, 400, false, "Invalid issueId.");
 
     if (!Array.isArray(production_photos))
       return resp(res, 400, false, "production_photos must be an array.");
 
-    issue.applyProductionCompletion({
-      machines,
-      production_notes,
-      production_photos,
-      production_started_at,
-      production_completed_at,
-      production_duration_seconds,
-    });
-    await issue.save();
+    // BUG FIX: previously this rejected the ENTIRE save (photos included)
+    // whenever `machines` was empty. If a caller ever saves photos/notes
+    // without a machine log (e.g. testing the endpoint directly, or a
+    // future "quick photo" flow), the photos were being thrown away along
+    // with the rejected machine data. Photos/notes now save independently
+    // of the machine log; `machines` is only validated when it's actually
+    // provided.
+    if (machines.length > 0) {
+      for (const m of machines) {
+        if (!m.machine_id?.trim())   return resp(res, 400, false, "Each machine must have a machine_id.");
+        if (!m.machine_name?.trim()) return resp(res, 400, false, "Each machine must have a machine_name.");
+        if ((m.printing_time_mins ?? 0) < 0 || (m.machine_run_time_mins ?? 0) < 0)
+          return resp(res, 400, false, "Machine times cannot be negative.");
+        if (!Array.isArray(m.inks))
+          return resp(res, 400, false, `Machine "${m.machine_name}" must have an inks array.`);
+        for (const ink of m.inks) {
+          if (!ink.color?.trim())    return resp(res, 400, false, "Each ink entry must have a color.");
+          if ((ink.quantity ?? 0) < 0) return resp(res, 400, false, "Ink quantity cannot be negative.");
+        }
+      }
+    }
+
+    const secs = parseInt(production_duration_seconds, 10) || 0;
+
+    const setFields = {
+      production_notes:            String(production_notes || ""),
+      production_photos:           production_photos.filter((p) => typeof p === "string" && p.trim().length > 0),
+      production_started_at:       production_started_at   ? new Date(production_started_at)   : null,
+      production_completed_at:     production_completed_at ? new Date(production_completed_at) : new Date(),
+      production_duration_seconds: secs,
+      production_duration_display: MaterialIssue.secsToDisplay
+        ? MaterialIssue.secsToDisplay(secs)
+        : new Date(secs * 1000).toISOString().substr(11, 8),
+      production_status: "completed",
+    };
+    if (machines.length > 0) setFields.machines = machines;
+
+    // BUG FIX: switched from findById → mutate → save() to a single
+    // atomic findByIdAndUpdate($set, {new:true}). The old load/mutate/save
+    // pattern is vulnerable to being silently clobbered by any other
+    // concurrent write to the same document (e.g. a duplicate/double-click
+    // submit, or another action touching this issue in between the read
+    // and the save) — whichever save() lands last would win and could
+    // overwrite these fields with whatever the other in-memory copy had.
+    // $set only ever touches the fields listed here, so there is no way
+    // for a race to wipe out photos that were just written.
+    const updated = await MaterialIssue.findByIdAndUpdate(
+      issueId,
+      { $set: setFields },
+      { new: true, runValidators: true },
+    );
+
+    if (!updated) return resp(res, 404, false, "Material issue record not found.");
+
+    // Log exactly what Mongo actually persisted — check your server logs
+    // after saving from the UI; if production_photos shows up here but is
+    // still empty on the next GET, the problem is downstream of this
+    // write (a stale cache, wrong environment/DB, or a second write
+    // clobbering it afterward) rather than in this save itself.
+    console.log(
+      `[production] ${updated.issue_no} saved — photos: ${updated.production_photos.length}, ` +
+      `status: ${updated.production_status}`,
+    );
 
     return resp(res, 200, true, "Production metadata saved.", {
-      issue_no:                    issue.issue_no,
-      machines:                    issue.machines,
-      production_notes:            issue.production_notes,
-      production_photos:           issue.production_photos,
-      production_status:           issue.production_status,
-      production_duration_display: issue.production_duration_display,
+      issue_no:                    updated.issue_no,
+      machines:                    updated.machines,
+      production_notes:            updated.production_notes,
+      production_photos:           updated.production_photos,
+      production_status:           updated.production_status,
+      production_duration_display: updated.production_duration_display,
     });
   } catch (err) {
     console.error("recordProductionCompletion:", err);
