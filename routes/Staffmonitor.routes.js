@@ -10,6 +10,7 @@ const {
   forceLogout, requestPermission, getPendingPermissions, respondPermission,
   startFieldWork, finishFieldWork, requestFieldWorkResume,
   resumeFieldWork, closeFieldWork, getFieldWorkQueue,
+  exportMonthlyAttendance,exportDailyAttendance
 } = require("../controller/Staffmonitor.controller");
 const { VerfiyToken } = require("../helper/shared.helper");
 const AdminUsersSchema = require("../modals/adminusers.modals");
@@ -71,6 +72,13 @@ router.post("/session/field-work/:staffId/close",   requireSuperAdmin, closeFiel
 router.get("/monitor",               getMonitorList);
 router.get("/monitor/:id/details",   getStaffDetails);
 router.get("/monitor/:id/job-time",  getStaffJobTime);
+
+// Attendance export — month-wise, date-wise in/out register as .xlsx
+// GET /staff-monitor/export/attendance?month=YYYY-MM&staffId=<optional>
+router.get("/export/attendance", exportMonthlyAttendance);
+router.get("/export/attendance/daily", exportDailyAttendance);
+
+
 
 // Task logs
 router.post  ("/task-log",         submitTaskLog);

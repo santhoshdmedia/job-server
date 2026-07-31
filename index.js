@@ -48,7 +48,7 @@ app.use((err, req, res, next) => {
 
 // ==================== START ====================
 
-const Port = process.env.PORT || 8080;
+const Port = process.env.PORT || 8000;
 const Host = process.env.HOST || "0.0.0.0";
 
 mongoose.connect(process.env.MONGODB_URI).then(() => {
@@ -58,11 +58,4 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
     console.log(`🚀 Server on http://${localIp || Host}:${Port}`);
   });
 
-  // ==================== STAFF AUTO-LOGOUT SWEEP (disabled) ====================
-  // The automatic 7 PM (IST) auto-logout has been removed. Staff attendance
-  // is now controlled entirely by the user via "In Time" / "Out Time" in the
-  // navbar (see Staffmonitor.controller.js recordLogin/recordLogout) and no
-  // longer force-closed on a schedule. The sweep function still exists in
-  // the controller (unused) in case a manual/admin-triggered sweep is ever
-  // needed again, but nothing calls it automatically anymore.
 });

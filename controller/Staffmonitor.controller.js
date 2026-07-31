@@ -12,6 +12,7 @@
  */
 
 const axios = require("axios");
+const ExcelJS = require("exceljs");
 const AdminUsersSchema = require("../modals/adminusers.modals");
 const { StaffSession, StaffTaskLog, StaffAssignedTask } = require("../modals/Staffmonitor.model");
 const Job = require("../modals/job.modal");
@@ -1383,6 +1384,393 @@ const deleteAssignedTask = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /staff-monitor/export/attendance?month=YYYY-MM&staffId=<optional>
+//
+// Builds a month-wise, date-wise attendance register as an .xlsx download.
+// Layout (one sheet per month):
+//
+//   Row 1        : "Attendance Register — <Month Year>"   (title, merged across)
+//   Row 2 (hdr)   : Name | 01 (Mon) [merged 2 cols] | 02 (Tue) [merged 2 cols] | ... | Total Working Hours
+//   Row 3 (hdr)   :      | In     | Out             | In     | Out             | ... |
+//   Per staff (2 data rows, Name + Total merged down across both):
+//     Row A       :      | 9:00 AM | 6:00 PM         | 9:15 AM | 6:05 PM        | ... |
+//     Row B       :      | Working hours for that day [merged 2 cols]           | ... |
+//
+// If a staff member has more than one session on a date (e.g. field-work
+// out/in cycles), the earliest login and the latest logout for that date are
+// shown, and the working seconds across all of that day's sessions are summed
+// into that day's "hours" row. The far-right column is the staff's total
+// working hours for the whole month.
+// ─────────────────────────────────────────────────────────────────────────────
+const pad2 = (n) => String(n).padStart(2, "0");
+
+const fmtClockTime = (d) => {
+  if (!d) return "";
+  const dt = new Date(d);
+  let h = dt.getHours();
+  const m = dt.getMinutes();
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${pad2(m)} ${ampm}`;
+};
+
+// Same as fmtClockTime, but prefixes the date (e.g. "Jul 1, 9:00 AM").
+// Used when a session's working hours run past 24h, so the sheet doesn't
+// silently show a bare time that could belong to a different calendar day.
+const fmtDateTime = (d) => {
+  if (!d) return "";
+  const dt = new Date(d);
+  const datePart = dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return `${datePart}, ${fmtClockTime(dt)}`;
+};
+
+const DAY_SECONDS = 24 * 3600;
+
+// Picks fmtDateTime when the day's total working seconds exceed 24h
+// (overnight / multi-day sessions), otherwise the plain time-only format.
+const fmtInOutTime = (d, workSecs) => (workSecs > DAY_SECONDS ? fmtDateTime(d) : fmtClockTime(d));
+
+const secsToHoursMinutes = (total) => {
+  const s = Math.max(0, Math.floor(total || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}h ${pad2(m)}m`;
+};
+
+const HEADER_FILL   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF3F4F6" } };
+const WEEKEND_FILL  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF7ED" } };
+const TOTAL_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFECFDF5" } };
+const HOURS_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0FDF4" } };
+const THIN_BORDER   = { style: "thin", color: { argb: "FFE5E7EB" } };
+const CELL_BORDER   = { top: THIN_BORDER, left: THIN_BORDER, bottom: THIN_BORDER, right: THIN_BORDER };
+
+// staffId -> dateStr -> { firstIn, lastOut, workSecs } for sessions in [startDateStr, endDateStr]
+const buildAttendanceGrid = async (staffIds, startDateStr, endDateStr) => {
+  const sessions = await StaffSession.find({
+    staff_id: { $in: staffIds },
+    date: { $gte: startDateStr, $lte: endDateStr },
+  }).sort({ login_at: 1 }).lean();
+
+  const grid = {};
+  for (const s of sessions) {
+    const sid = s.staff_id.toString();
+    if (!grid[sid]) grid[sid] = {};
+    const d = s.date;
+    if (!grid[sid][d]) grid[sid][d] = { firstIn: s.login_at, lastOut: s.logout_at || null, workSecs: 0 };
+    const cell = grid[sid][d];
+
+    if (new Date(s.login_at) < new Date(cell.firstIn)) cell.firstIn = s.login_at;
+    if (s.logout_at && (!cell.lastOut || new Date(s.logout_at) > new Date(cell.lastOut))) {
+      cell.lastOut = s.logout_at;
+    }
+
+    const daySecs = s.logout_at
+      ? (s.working_seconds || 0)
+      : Math.max(0, Math.floor((Date.now() - new Date(s.login_at).getTime()) / 1000) - (s.break_seconds || 0));
+    cell.workSecs += daySecs;
+  }
+  return grid;
+};
+
+const exportMonthlyAttendance = async (req, res) => {
+  try {
+    const monthParam = req.query.month || todayStr().slice(0, 7); // "YYYY-MM"
+    if (!/^\d{4}-\d{2}$/.test(monthParam)) {
+      return errorResponse(res, "Invalid month. Use format YYYY-MM, e.g. 2026-07.");
+    }
+    const [yearStr, monStr] = monthParam.split("-");
+    const year  = Number(yearStr);
+    const month = Number(monStr); // 1-12
+    const daysInMonth = new Date(year, month, 0).getDate();
+
+    const staffFilter = {};
+    if (req.query.staffId) staffFilter._id = req.query.staffId;
+
+    const staffList = await AdminUsersSchema.find(staffFilter, { name: 1, email: 1, role: 1 })
+      .sort({ name: 1 })
+      .lean();
+    if (!staffList.length) return errorResponse(res, "No staff found for the given filter.");
+
+    const staffIds = staffList.map((s) => s._id);
+    const startDateStr = `${monthParam}-01`;
+    const endDateStr   = `${monthParam}-${pad2(daysInMonth)}`;
+    const grid = await buildAttendanceGrid(staffIds, startDateStr, endDateStr);
+
+    // ── Build workbook ──────────────────────────────────────────────────
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Job Sheet App";
+    workbook.created = new Date();
+
+    const monthLabel = new Date(year, month - 1, 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+    const sheet = workbook.addWorksheet(monthLabel.replace(/[\\/*?:[\]]/g, ""));
+
+    const NAME_COL       = 1;
+    const FIRST_DATE_COL = 2; // each date occupies 2 columns: In / Out
+    const TOTAL_COL      = FIRST_DATE_COL + daysInMonth * 2;
+
+    // Title row
+    sheet.mergeCells(1, 1, 1, TOTAL_COL);
+    const titleCell = sheet.getCell(1, 1);
+    titleCell.value = `Attendance Register — ${monthLabel}`;
+    titleCell.font = { bold: true, size: 14 };
+    titleCell.alignment = { horizontal: "center", vertical: "middle" };
+    sheet.getRow(1).height = 26;
+
+    const HEADER_ROW_1   = 2;
+    const HEADER_ROW_2   = 3;
+    const DATA_START_ROW = 4;
+    const ROWS_PER_STAFF = 2; // Row A = In/Out, Row B = that day's working hours
+
+    // Name column header (merged down across both header rows)
+    sheet.mergeCells(HEADER_ROW_1, NAME_COL, HEADER_ROW_2, NAME_COL);
+    sheet.getCell(HEADER_ROW_1, NAME_COL).value = "Name";
+
+    // Total Working Hours column header (merged down across both header rows)
+    sheet.mergeCells(HEADER_ROW_1, TOTAL_COL, HEADER_ROW_2, TOTAL_COL);
+    sheet.getCell(HEADER_ROW_1, TOTAL_COL).value = "Total Working Hours";
+
+    const weekendCols = new Set();
+
+    // Per-date headers + In/Out sub-headers
+    for (let day = 1; day <= daysInMonth; day++) {
+      const col = FIRST_DATE_COL + (day - 1) * 2;
+      const dateObj = new Date(year, month - 1, day);
+      const weekday = dateObj.toLocaleDateString("en-US", { weekday: "short" });
+      if (weekday === "Sun" || weekday === "Sat") { weekendCols.add(col); weekendCols.add(col + 1); }
+
+      sheet.mergeCells(HEADER_ROW_1, col, HEADER_ROW_1, col + 1);
+      sheet.getCell(HEADER_ROW_1, col).value = `${pad2(day)} (${weekday})`;
+      sheet.getCell(HEADER_ROW_2, col).value = "In";
+      sheet.getCell(HEADER_ROW_2, col + 1).value = "Out";
+    }
+
+    // Style header rows
+    [HEADER_ROW_1, HEADER_ROW_2].forEach((r) => {
+      sheet.getRow(r).eachCell({ includeEmpty: true }, (cell) => {
+        cell.font = { bold: true, size: 10 };
+        cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+        cell.fill = HEADER_FILL;
+        cell.border = CELL_BORDER;
+      });
+    });
+
+    // Data — 2 rows per staff member: In/Out row, then a "working hours per day" row
+    staffList.forEach((staff, idx) => {
+      const rowA = DATA_START_ROW + idx * ROWS_PER_STAFF;     // In / Out
+      const rowB = rowA + 1;                                   // Working hours for that day
+      const sid = staff._id.toString();
+      const staffGrid = grid[sid] || {};
+
+      // Name merged vertically across this staff's 2 rows
+      sheet.mergeCells(rowA, NAME_COL, rowB, NAME_COL);
+      const nameCell = sheet.getCell(rowA, NAME_COL);
+      nameCell.value = staff.name;
+      nameCell.font = { bold: true, size: 10 };
+      nameCell.alignment = { vertical: "middle" };
+
+      let monthWorkSecs = 0;
+
+      for (let day = 1; day <= daysInMonth; day++) {
+        const col = FIRST_DATE_COL + (day - 1) * 2;
+        const dateStr = `${monthParam}-${pad2(day)}`;
+        const cellData = staffGrid[dateStr];
+
+        const inCell  = sheet.getCell(rowA, col);
+        const outCell = sheet.getCell(rowA, col + 1);
+
+        // Merged "working hours" cell for this date, directly below In/Out
+        sheet.mergeCells(rowB, col, rowB, col + 1);
+        const hoursCell = sheet.getCell(rowB, col);
+
+        if (cellData) {
+          inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+          outCell.value = cellData.lastOut ? fmtInOutTime(cellData.lastOut, cellData.workSecs) : "—";
+          hoursCell.value = cellData.lastOut ? secsToHoursMinutes(cellData.workSecs) : "—";
+          monthWorkSecs += cellData.workSecs;
+        } else {
+          inCell.value  = "";
+          outCell.value = "";
+          hoursCell.value = "";
+        }
+
+        inCell.alignment  = { horizontal: "center" };
+        outCell.alignment = { horizontal: "center" };
+        inCell.font  = { size: 9.5 };
+        outCell.font = { size: 9.5 };
+
+        hoursCell.alignment = { horizontal: "center", vertical: "middle" };
+        hoursCell.font = { size: 9.5, italic: true, color: { argb: "FF15803D" } };
+        hoursCell.fill = HOURS_FILL;
+
+        if (weekendCols.has(col))     inCell.fill  = WEEKEND_FILL;
+        if (weekendCols.has(col + 1)) outCell.fill = WEEKEND_FILL;
+      }
+
+      // Total Working Hours for the month — merged vertically across this staff's 2 rows
+      sheet.mergeCells(rowA, TOTAL_COL, rowB, TOTAL_COL);
+      const totalCell = sheet.getCell(rowA, TOTAL_COL);
+      totalCell.value = secsToHoursMinutes(monthWorkSecs);
+      totalCell.font = { bold: true, size: 10 };
+      totalCell.alignment = { horizontal: "center", vertical: "middle" };
+      totalCell.fill = TOTAL_FILL;
+
+      [rowA, rowB].forEach((r) => {
+        sheet.getRow(r).eachCell({ includeEmpty: true }, (cell) => { cell.border = CELL_BORDER; });
+      });
+    });
+
+    // Column widths
+    sheet.getColumn(NAME_COL).width = 22;
+    for (let day = 1; day <= daysInMonth; day++) {
+      const col = FIRST_DATE_COL + (day - 1) * 2;
+      sheet.getColumn(col).width = 11;
+      sheet.getColumn(col + 1).width = 11;
+    }
+    sheet.getColumn(TOTAL_COL).width = 18;
+
+    sheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3 }];
+
+    const fileName = `Attendance_${monthLabel.replace(/\s+/g, "_")}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err) {
+    console.error("[exportMonthlyAttendance]", err);
+    return errorResponse(res, "Failed to export attendance.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /staff-monitor/export/attendance/daily?date=YYYY-MM-DD&staffId=<optional>
+//
+// Builds a single day's attendance sheet as an .xlsx download, using the same
+// pattern as the monthly register: each staff member gets 2 rows —
+//   Row A : Name | In Time | Out Time
+//   Row B :      | Working Hours  [merged across the In/Out columns]
+// (Name is merged vertically down across both of that staff's rows.)
+// ─────────────────────────────────────────────────────────────────────────────
+const exportDailyAttendance = async (req, res) => {
+  try {
+    const dateParam = req.query.date || todayStr(); // "YYYY-MM-DD"
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+      return errorResponse(res, "Invalid date. Use format YYYY-MM-DD, e.g. 2026-07-31.");
+    }
+
+    const staffFilter = {};
+    if (req.query.staffId) staffFilter._id = req.query.staffId;
+
+    const staffList = await AdminUsersSchema.find(staffFilter, { name: 1, email: 1, role: 1 })
+      .sort({ name: 1 })
+      .lean();
+    if (!staffList.length) return errorResponse(res, "No staff found for the given filter.");
+
+    const staffIds = staffList.map((s) => s._id);
+    const grid = await buildAttendanceGrid(staffIds, dateParam, dateParam);
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Job Sheet App";
+    workbook.created = new Date();
+
+    const dateObj = new Date(`${dateParam}T00:00:00`);
+    const dateLabel = dateObj.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+    const sheet = workbook.addWorksheet(dateParam);
+
+    const NAME_COL = 1;
+    const IN_COL   = 2;
+    const OUT_COL  = 3;
+
+    // Title row
+    sheet.mergeCells(1, 1, 1, 3);
+    const titleCell = sheet.getCell(1, 1);
+    titleCell.value = `Daily Attendance — ${dateLabel}`;
+    titleCell.font = { bold: true, size: 14 };
+    titleCell.alignment = { horizontal: "center", vertical: "middle" };
+    sheet.getRow(1).height = 26;
+
+    // Single header row — the date itself is only ever "one column pair", so
+    // (unlike the monthly sheet) there's no separate date row above it.
+    const HEADER_ROW = 2;
+    sheet.getCell(HEADER_ROW, NAME_COL).value = "Name";
+    sheet.getCell(HEADER_ROW, IN_COL).value   = "In Time";
+    sheet.getCell(HEADER_ROW, OUT_COL).value  = "Out Time";
+    sheet.getRow(HEADER_ROW).eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = { bold: true, size: 11 };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.fill = HEADER_FILL;
+      cell.border = CELL_BORDER;
+    });
+
+    const DATA_START_ROW = 3;
+    const ROWS_PER_STAFF = 2; // Row A = In/Out, Row B = working hours (merged under In/Out)
+
+    staffList.forEach((staff, idx) => {
+      const rowA = DATA_START_ROW + idx * ROWS_PER_STAFF; // In / Out
+      const rowB = rowA + 1;                               // Working hours
+      const sid = staff._id.toString();
+      const cellData = (grid[sid] || {})[dateParam];
+
+      // Name merged vertically across this staff's 2 rows
+      sheet.mergeCells(rowA, NAME_COL, rowB, NAME_COL);
+      const nameCell = sheet.getCell(rowA, NAME_COL);
+      nameCell.font = { bold: true, size: 10.5 };
+      nameCell.alignment = { vertical: "middle" };
+
+      const inCell  = sheet.getCell(rowA, IN_COL);
+      const outCell = sheet.getCell(rowA, OUT_COL);
+
+      // Merged "working hours" cell directly below the In/Out row
+      sheet.mergeCells(rowB, IN_COL, rowB, OUT_COL);
+      const hoursCell = sheet.getCell(rowB, IN_COL);
+
+      if (cellData) {
+        nameCell.value  = staff.name;
+        inCell.value    = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+        outCell.value   = cellData.lastOut ? fmtInOutTime(cellData.lastOut, cellData.workSecs) : "—";
+        hoursCell.value = cellData.lastOut ? secsToHoursMinutes(cellData.workSecs) : "—";
+        inCell.font  = { size: 10.5 };
+        outCell.font = { size: 10.5 };
+      } else {
+        nameCell.value  = staff.name;
+        inCell.value    = "Absent";
+        outCell.value   = "";
+        hoursCell.value = "";
+        inCell.font  = { size: 10.5, italic: true, color: { argb: "FF9CA3AF" } };
+        outCell.font = { size: 10.5 };
+      }
+
+      inCell.alignment  = { horizontal: "center", vertical: "middle" };
+      outCell.alignment = { horizontal: "center", vertical: "middle" };
+
+      hoursCell.alignment = { horizontal: "center", vertical: "middle" };
+      hoursCell.font = { size: 10.5, bold: true, color: { argb: "FF15803D" } };
+      hoursCell.fill = HOURS_FILL;
+
+      [rowA, rowB].forEach((r) => {
+        sheet.getRow(r).eachCell({ includeEmpty: true }, (cell) => { cell.border = CELL_BORDER; });
+      });
+    });
+
+    sheet.getColumn(NAME_COL).width = 26;
+    sheet.getColumn(IN_COL).width   = 16;
+    sheet.getColumn(OUT_COL).width  = 16;
+    sheet.views = [{ state: "frozen", ySplit: 2 }];
+
+    const fileName = `Attendance_${dateParam}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err) {
+    console.error("[exportDailyAttendance]", err);
+    return errorResponse(res, "Failed to export daily attendance.");
+  }
+};
+
 module.exports = {
   recordLogin, recordLogout, startBreak, endBreak,
   getMonitorList, getStaffDetails, getStaffJobTime,
@@ -1396,4 +1784,6 @@ module.exports = {
   // Field work (marketing "going out" with ETA)
   startFieldWork, finishFieldWork, requestFieldWorkResume,
   resumeFieldWork, closeFieldWork, getFieldWorkQueue,
+  // Attendance export
+  exportMonthlyAttendance, exportDailyAttendance,
 };
