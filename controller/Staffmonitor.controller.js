@@ -346,8 +346,202 @@ const forceLogout = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /session/permission/request   body: { staffId, reason, requested_until }
-// Staff asks for permission to keep working past the 7 PM auto-logout cutoff.
+// PATCH /session/:sessionId/edit-time   (super admin only)
+// body: { login_at, logout_at }  — logout_at may be null/omitted to mark the
+// session as still open (e.g. correcting a wrongly-closed session).
+//
+// Recomputes duration_seconds / working_seconds / overtime_seconds from the
+// corrected times (minus whatever break time was already recorded on this
+// session) so every downstream view — the monitor dashboard, staff detail
+// drawer, and the Excel exports — stays consistent with the edited times.
+// Every edit is appended to `edit_history` for an audit trail.
+// ─────────────────────────────────────────────────────────────────────────────
+const editSessionTime = async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { login_at, logout_at } = req.body;
+
+    if (!login_at) return errorResponse(res, "login_at is required.");
+    const newLogin = new Date(login_at);
+    if (Number.isNaN(newLogin.getTime())) return errorResponse(res, "Invalid login_at.");
+
+    let newLogout = null;
+    if (logout_at) {
+      newLogout = new Date(logout_at);
+      if (Number.isNaN(newLogout.getTime())) return errorResponse(res, "Invalid logout_at.");
+      if (newLogout <= newLogin) return errorResponse(res, "Logout time must be after login time.");
+    }
+
+    const session = await StaffSession.findById(sessionId);
+    if (!session) return errorResponse(res, "Session not found.");
+
+    const previousLoginAt  = session.login_at;
+    const previousLogoutAt = session.logout_at;
+    const now = new Date();
+
+    session.login_at = newLogin;
+    // Keep the "date" bucket (used by the monitor list and exports) in sync
+    // with the corrected login time so it lands on the right day.
+    session.date = newLogin.toISOString().slice(0, 10);
+
+    if (newLogout) {
+      session.logout_at        = newLogout;
+      session.duration_seconds = Math.max(0, Math.floor((newLogout - newLogin) / 1000));
+      session.working_seconds  = Math.max(0, session.duration_seconds - (session.break_seconds || 0));
+      session.overtime_seconds = Math.max(0, session.working_seconds - STANDARD_WORK_SECONDS);
+    } else {
+      // No logout given — treat this session as still open / reopened.
+      session.logout_at        = null;
+      session.duration_seconds = 0;
+      session.working_seconds  = 0;
+      session.overtime_seconds = 0;
+      session.logout_type      = undefined;
+    }
+
+    session.manually_edited = true;
+    session.edit_history = session.edit_history || [];
+    session.edit_history.push({
+      edited_by: req.user?._id || null,
+      edited_by_name: req.user?.name || "Super Admin",
+      edited_at: now,
+      previous_login_at: previousLoginAt,
+      previous_logout_at: previousLogoutAt,
+      new_login_at: newLogin,
+      new_logout_at: newLogout,
+    });
+
+    await session.save();
+
+    // If this was the staff member's most recent session, keep isOnline in sync
+    // (e.g. re-opening a session should flip them back online).
+    const latestSession = await StaffSession.findOne({ staff_id: session.staff_id }).sort({ login_at: -1 });
+    if (latestSession && String(latestSession._id) === String(session._id)) {
+      await AdminUsersSchema.findByIdAndUpdate(session.staff_id, { isOnline: !session.logout_at });
+    }
+
+    return successResponse(res, "Session time updated.", { session });
+  } catch (err) {
+    console.error("[editSessionTime]", err);
+    return errorResponse(res, "Failed to update session time.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /session/manual-entry   (super admin only)
+// body: { staffId, login_at, logout_at }
+//
+// Lets a super admin add a brand-new attendance entry for a staff member —
+// e.g. they forgot to clock in/out that day, or attendance was taken on
+// paper. logout_at may be omitted to create it as a currently-open session.
+// Distinct from editSessionTime, which corrects an existing session; this
+// creates one from scratch.
+// ─────────────────────────────────────────────────────────────────────────────
+const createManualSession = async (req, res) => {
+  try {
+    const { staffId, login_at, logout_at } = req.body;
+
+    if (!staffId) return errorResponse(res, "staffId is required.");
+    if (!login_at) return errorResponse(res, "login_at is required.");
+
+    const newLogin = new Date(login_at);
+    if (Number.isNaN(newLogin.getTime())) return errorResponse(res, "Invalid login_at.");
+
+    let newLogout = null;
+    if (logout_at) {
+      newLogout = new Date(logout_at);
+      if (Number.isNaN(newLogout.getTime())) return errorResponse(res, "Invalid logout_at.");
+      if (newLogout <= newLogin) return errorResponse(res, "Logout time must be after login time.");
+    }
+
+    const staff = await AdminUsersSchema.findById(staffId, { name: 1 });
+    if (!staff) return errorResponse(res, "Staff not found.");
+
+    const now = new Date();
+    const duration_seconds = newLogout ? Math.max(0, Math.floor((newLogout - newLogin) / 1000)) : 0;
+    const working_seconds  = newLogout ? duration_seconds : 0;
+    const overtime_seconds = newLogout ? Math.max(0, working_seconds - STANDARD_WORK_SECONDS) : 0;
+
+    const session = await StaffSession.create({
+      staff_id: staffId,
+      date: newLogin.toISOString().slice(0, 10),
+      login_at: newLogin,
+      logout_at: newLogout,
+      duration_seconds,
+      working_seconds,
+      overtime_seconds,
+      break_seconds: 0,
+      manually_edited: true,
+      edit_history: [{
+        edited_by: req.user?._id || null,
+        edited_by_name: req.user?.name || "Super Admin",
+        edited_at: now,
+        previous_login_at: null,
+        previous_logout_at: null,
+        new_login_at: newLogin,
+        new_logout_at: newLogout,
+      }],
+    });
+
+    // If this new entry is the staff member's most recent session, keep
+    // isOnline in sync (e.g. a manually-added open entry marks them online).
+    const latestSession = await StaffSession.findOne({ staff_id: staffId }).sort({ login_at: -1 });
+    if (latestSession && String(latestSession._id) === String(session._id)) {
+      await AdminUsersSchema.findByIdAndUpdate(staffId, { isOnline: !session.logout_at });
+    }
+
+    return successResponse(res, "Manual attendance entry added.", { session });
+  } catch (err) {
+    console.error("[createManualSession]", err);
+    return errorResponse(res, "Failed to add manual attendance entry.");
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /staff/:staffId/pay-settings   (super admin only)
+// body: { standard_hours_per_day, monthly_salary }
+//
+// Sets the per-day "actual"/expected working hours and the fixed monthly
+// salary used by the monthly attendance Excel export to work out extra
+// (overtime) hours, shortfall hours, and the payable salary.
+// ─────────────────────────────────────────────────────────────────────────────
+const updatePaySettings = async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { standard_hours_per_day, monthly_salary } = req.body;
+
+    const update = {};
+    if (standard_hours_per_day !== undefined) {
+      const hrs = Number(standard_hours_per_day);
+      if (Number.isNaN(hrs) || hrs < 0 || hrs > 24) {
+        return errorResponse(res, "standard_hours_per_day must be a number between 0 and 24.");
+      }
+      update.standard_hours_per_day = hrs;
+    }
+    if (monthly_salary !== undefined) {
+      const sal = Number(monthly_salary);
+      if (Number.isNaN(sal) || sal < 0) {
+        return errorResponse(res, "monthly_salary must be a non-negative number.");
+      }
+      update.monthly_salary = sal;
+    }
+    if (!Object.keys(update).length) {
+      return errorResponse(res, "Nothing to update — provide standard_hours_per_day and/or monthly_salary.");
+    }
+
+    const staff = await AdminUsersSchema.findByIdAndUpdate(staffId, update, {
+      new: true,
+      fields: { name: 1, email: 1, role: 1, standard_hours_per_day: 1, monthly_salary: 1 },
+    });
+    if (!staff) return errorResponse(res, "Staff not found.");
+
+    return successResponse(res, "Pay settings updated.", { staff });
+  } catch (err) {
+    console.error("[updatePaySettings]", err);
+    return errorResponse(res, "Failed to update pay settings.");
+  }
+};
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 const requestPermission = async (req, res) => {
   try {
@@ -1391,17 +1585,20 @@ const deleteAssignedTask = async (req, res) => {
 // Layout (one sheet per month):
 //
 //   Row 1        : "Attendance Register — <Month Year>"   (title, merged across)
-//   Row 2 (hdr)   : Name | 01 (Mon) [merged 2 cols] | 02 (Tue) [merged 2 cols] | ... | Total Working Hours
-//   Row 3 (hdr)   :      | In     | Out             | In     | Out             | ... |
-//   Per staff (2 data rows, Name + Total merged down across both):
-//     Row A       :      | 9:00 AM | 6:00 PM         | 9:15 AM | 6:05 PM        | ... |
-//     Row B       :      | Working hours for that day [merged 2 cols]           | ... |
+//   Row 2 (hdr)  : Name | Detail | 01 (Mon) [merged 2 cols] | ... | Standard Hrs | Total Worked | Total Break | Extra Hrs | Shortfall Hrs | Adjusted Hrs | Payable Salary
+//   Row 3 (hdr)  :      |        | In     | Out             | ... |
+//   Per staff (4 data rows — Name + every summary column merged down across all 4):
+//     Row A (In/Out)  :      | In / Out | 9:00 AM | 6:00 PM  | ... |
+//     Row B (Break)   :      | Break    | 30m [merged 2 cols]      | ... |
+//     Row C (Working) :      | Working  | 7h 30m [merged 2 cols]   | ... |
+//     Row D (Extra)   :      | Extra    | +1h 00m [merged 2 cols]  | ... |
 //
-// If a staff member has more than one session on a date (e.g. field-work
-// out/in cycles), the earliest login and the latest logout for that date are
-// shown, and the working seconds across all of that day's sessions are summed
-// into that day's "hours" row. The far-right column is the staff's total
-// working hours for the whole month.
+// Extra/shortfall hours per day are worked out against that staff member's
+// own "standard_hours_per_day" setting (super admin sets this per staff).
+// If the month's Total Working Hours falls short of the Standard Hours
+// target, the Extra hours banked on other days are applied to make up the
+// difference — the result is "Adjusted Hrs". Payable Salary is the staff's
+// monthly_salary prorated by (Adjusted Hrs / Standard Hrs).
 // ─────────────────────────────────────────────────────────────────────────────
 const pad2 = (n) => String(n).padStart(2, "0");
 
@@ -1439,14 +1636,20 @@ const secsToHoursMinutes = (total) => {
   return `${h}h ${pad2(m)}m`;
 };
 
+const fmtCurrency = (amount) =>
+  `₹${Number(amount || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
 const HEADER_FILL   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF3F4F6" } };
 const WEEKEND_FILL  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF7ED" } };
 const TOTAL_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFECFDF5" } };
 const HOURS_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0FDF4" } };
+const BREAK_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFEF2F2" } };
+const EXTRA_FILL    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEFF6FF" } };
+const SALARY_FILL   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFDF4E7" } };
 const THIN_BORDER   = { style: "thin", color: { argb: "FFE5E7EB" } };
 const CELL_BORDER   = { top: THIN_BORDER, left: THIN_BORDER, bottom: THIN_BORDER, right: THIN_BORDER };
 
-// staffId -> dateStr -> { firstIn, lastOut, workSecs } for sessions in [startDateStr, endDateStr]
+// staffId -> dateStr -> { firstIn, lastOut, breakSecs, workSecs } for sessions in [startDateStr, endDateStr]
 const buildAttendanceGrid = async (staffIds, startDateStr, endDateStr) => {
   const sessions = await StaffSession.find({
     staff_id: { $in: staffIds },
@@ -1458,18 +1661,28 @@ const buildAttendanceGrid = async (staffIds, startDateStr, endDateStr) => {
     const sid = s.staff_id.toString();
     if (!grid[sid]) grid[sid] = {};
     const d = s.date;
-    if (!grid[sid][d]) grid[sid][d] = { firstIn: s.login_at, lastOut: s.logout_at || null, workSecs: 0 };
+    if (!grid[sid][d]) grid[sid][d] = { firstIn: s.login_at, lastOut: s.logout_at || null, breakSecs: 0 };
     const cell = grid[sid][d];
 
     if (new Date(s.login_at) < new Date(cell.firstIn)) cell.firstIn = s.login_at;
     if (s.logout_at && (!cell.lastOut || new Date(s.logout_at) > new Date(cell.lastOut))) {
       cell.lastOut = s.logout_at;
     }
+    cell.breakSecs += (s.break_seconds || 0);
+  }
 
-    const daySecs = s.logout_at
-      ? (s.working_seconds || 0)
-      : Math.max(0, Math.floor((Date.now() - new Date(s.login_at).getTime()) / 1000) - (s.break_seconds || 0));
-    cell.workSecs += daySecs;
+  // Working hours are computed directly from each day's first-In to last-Out
+  // span (minus any recorded breaks) — not from the session's stored
+  // `working_seconds` field — so the exported "Working" row always matches
+  // exactly what the In/Out columns show, even after an admin edits a
+  // session's login/logout time.
+  for (const sid of Object.keys(grid)) {
+    for (const d of Object.keys(grid[sid])) {
+      const cell = grid[sid][d];
+      const endMs = cell.lastOut ? new Date(cell.lastOut).getTime() : Date.now();
+      const spanSecs = Math.max(0, Math.floor((endMs - new Date(cell.firstIn).getTime()) / 1000));
+      cell.workSecs = Math.max(0, spanSecs - (cell.breakSecs || 0));
+    }
   }
   return grid;
 };
@@ -1485,12 +1698,21 @@ const exportMonthlyAttendance = async (req, res) => {
     const month = Number(monStr); // 1-12
     const daysInMonth = new Date(year, month, 0).getDate();
 
+    // Sundays are treated as holidays — they don't count toward the month's
+    // required (standard) hours target. Every other day of the month does,
+    // whether or not the staff member actually showed up.
+    let sundayCount = 0;
+    for (let day = 1; day <= daysInMonth; day++) {
+      if (new Date(year, month - 1, day).getDay() === 0) sundayCount += 1;
+    }
+    const workingDaysInMonth = daysInMonth - sundayCount;
+
     const staffFilter = {};
     if (req.query.staffId) staffFilter._id = req.query.staffId;
 
-    const staffList = await AdminUsersSchema.find(staffFilter, { name: 1, email: 1, role: 1 })
-      .sort({ name: 1 })
-      .lean();
+    const staffList = await AdminUsersSchema.find(staffFilter, {
+      name: 1, email: 1, role: 1, standard_hours_per_day: 1, monthly_salary: 1,
+    }).sort({ name: 1 }).lean();
     if (!staffList.length) return errorResponse(res, "No staff found for the given filter.");
 
     const staffIds = staffList.map((s) => s._id);
@@ -1507,41 +1729,66 @@ const exportMonthlyAttendance = async (req, res) => {
     const sheet = workbook.addWorksheet(monthLabel.replace(/[\\/*?:[\]]/g, ""));
 
     const NAME_COL       = 1;
-    const FIRST_DATE_COL = 2; // each date occupies 2 columns: In / Out
-    const TOTAL_COL      = FIRST_DATE_COL + daysInMonth * 2;
+    const METRIC_COL     = 2;
+    const FIRST_DATE_COL = 3; // each date occupies 2 columns: In / Out
+    const SUMMARY_START  = FIRST_DATE_COL + daysInMonth * 2;
+    const COL_STANDARD   = SUMMARY_START;
+    const COL_WORKED     = SUMMARY_START + 1;
+    const COL_BREAK      = SUMMARY_START + 2;
+    const COL_EXTRA      = SUMMARY_START + 3;
+    const COL_SHORTFALL  = SUMMARY_START + 4;
+    const COL_ADJUSTED   = SUMMARY_START + 5;
+    const COL_REMAINING_EXTRA = SUMMARY_START + 6;
+    const COL_SALARY     = SUMMARY_START + 7;
+    const LAST_COL       = COL_SALARY;
 
     // Title row
-    sheet.mergeCells(1, 1, 1, TOTAL_COL);
+    sheet.mergeCells(1, 1, 1, LAST_COL);
     const titleCell = sheet.getCell(1, 1);
-    titleCell.value = `Attendance Register — ${monthLabel}`;
-    titleCell.font = { bold: true, size: 14 };
+    titleCell.value = `Attendance Register — ${monthLabel}  (Sundays are holidays · ${workingDaysInMonth} working days)`;
+    titleCell.font = { bold: true, size: 13 };
     titleCell.alignment = { horizontal: "center", vertical: "middle" };
     sheet.getRow(1).height = 26;
 
     const HEADER_ROW_1   = 2;
     const HEADER_ROW_2   = 3;
     const DATA_START_ROW = 4;
-    const ROWS_PER_STAFF = 2; // Row A = In/Out, Row B = that day's working hours
+    const ROWS_PER_STAFF = 4; // Row A = In/Out, Row B = Break, Row C = Working, Row D = Extra
 
-    // Name column header (merged down across both header rows)
+    // Name / Detail column headers (merged down across both header rows)
     sheet.mergeCells(HEADER_ROW_1, NAME_COL, HEADER_ROW_2, NAME_COL);
     sheet.getCell(HEADER_ROW_1, NAME_COL).value = "Name";
+    sheet.mergeCells(HEADER_ROW_1, METRIC_COL, HEADER_ROW_2, METRIC_COL);
+    sheet.getCell(HEADER_ROW_1, METRIC_COL).value = "Detail";
 
-    // Total Working Hours column header (merged down across both header rows)
-    sheet.mergeCells(HEADER_ROW_1, TOTAL_COL, HEADER_ROW_2, TOTAL_COL);
-    sheet.getCell(HEADER_ROW_1, TOTAL_COL).value = "Total Working Hours";
+    // Summary column headers (merged down across both header rows)
+    const summaryHeaders = [
+      [COL_STANDARD,  "Standard Hrs"],
+      [COL_WORKED,    "Total Worked"],
+      [COL_BREAK,     "Total Break"],
+      [COL_EXTRA,     "Extra Hrs"],
+      [COL_SHORTFALL, "Shortfall Hrs"],
+      [COL_ADJUSTED,  "Adjusted Hrs"],
+      [COL_REMAINING_EXTRA, "Remaining Extra Hrs"],
+      [COL_SALARY,    "Payable Salary"],
+    ];
+    summaryHeaders.forEach(([col, label]) => {
+      sheet.mergeCells(HEADER_ROW_1, col, HEADER_ROW_2, col);
+      sheet.getCell(HEADER_ROW_1, col).value = label;
+    });
 
-    const weekendCols = new Set();
+    const sundayCols = new Set();
 
     // Per-date headers + In/Out sub-headers
     for (let day = 1; day <= daysInMonth; day++) {
       const col = FIRST_DATE_COL + (day - 1) * 2;
       const dateObj = new Date(year, month - 1, day);
       const weekday = dateObj.toLocaleDateString("en-US", { weekday: "short" });
-      if (weekday === "Sun" || weekday === "Sat") { weekendCols.add(col); weekendCols.add(col + 1); }
+      const isSunday = dateObj.getDay() === 0;
+      if (isSunday) { sundayCols.add(col); sundayCols.add(col + 1); }
 
       sheet.mergeCells(HEADER_ROW_1, col, HEADER_ROW_1, col + 1);
-      sheet.getCell(HEADER_ROW_1, col).value = `${pad2(day)} (${weekday})`;
+      sheet.getCell(HEADER_ROW_1, col).value = isSunday ? `${pad2(day)} (Sun · Holiday)` : `${pad2(day)} (${weekday})`;
       sheet.getCell(HEADER_ROW_2, col).value = "In";
       sheet.getCell(HEADER_ROW_2, col + 1).value = "Out";
     }
@@ -1556,81 +1803,178 @@ const exportMonthlyAttendance = async (req, res) => {
       });
     });
 
-    // Data — 2 rows per staff member: In/Out row, then a "working hours per day" row
+    // Data — 4 rows per staff member: In/Out, Break, Working, Extra
     staffList.forEach((staff, idx) => {
-      const rowA = DATA_START_ROW + idx * ROWS_PER_STAFF;     // In / Out
-      const rowB = rowA + 1;                                   // Working hours for that day
+      const rowIn    = DATA_START_ROW + idx * ROWS_PER_STAFF;
+      const rowBreak = rowIn + 1;
+      const rowWork  = rowIn + 2;
+      const rowExtra = rowIn + 3;
       const sid = staff._id.toString();
       const staffGrid = grid[sid] || {};
+      const standardSecsPerDay = (Number(staff.standard_hours_per_day) || 10) * 3600;
 
-      // Name merged vertically across this staff's 2 rows
-      sheet.mergeCells(rowA, NAME_COL, rowB, NAME_COL);
-      const nameCell = sheet.getCell(rowA, NAME_COL);
+      // Name merged vertically across this staff's 4 rows
+      sheet.mergeCells(rowIn, NAME_COL, rowExtra, NAME_COL);
+      const nameCell = sheet.getCell(rowIn, NAME_COL);
       nameCell.value = staff.name;
       nameCell.font = { bold: true, size: 10 };
       nameCell.alignment = { vertical: "middle" };
 
-      let monthWorkSecs = 0;
+      // Row-metric labels (one per row, not merged)
+      const metricLabels = { [rowIn]: "In / Out", [rowBreak]: "Break", [rowWork]: "Working", [rowExtra]: "Extra" };
+      [rowIn, rowBreak, rowWork, rowExtra].forEach((r) => {
+        const c = sheet.getCell(r, METRIC_COL);
+        c.value = metricLabels[r];
+        c.font = { size: 9, italic: true, color: { argb: "FF6B7280" } };
+        c.alignment = { vertical: "middle" };
+      });
+
+      let totalWorkSecs = 0, totalBreakSecs = 0, totalExtraSecs = 0, totalShortfallSecs = 0;
 
       for (let day = 1; day <= daysInMonth; day++) {
         const col = FIRST_DATE_COL + (day - 1) * 2;
         const dateStr = `${monthParam}-${pad2(day)}`;
         const cellData = staffGrid[dateStr];
+        const isSunday = sundayCols.has(col);
 
-        const inCell  = sheet.getCell(rowA, col);
-        const outCell = sheet.getCell(rowA, col + 1);
+        const inCell  = sheet.getCell(rowIn, col);
+        const outCell = sheet.getCell(rowIn, col + 1);
 
-        // Merged "working hours" cell for this date, directly below In/Out
-        sheet.mergeCells(rowB, col, rowB, col + 1);
-        const hoursCell = sheet.getCell(rowB, col);
+        sheet.mergeCells(rowBreak, col, rowBreak, col + 1);
+        sheet.mergeCells(rowWork,  col, rowWork,  col + 1);
+        sheet.mergeCells(rowExtra, col, rowExtra, col + 1);
+        const breakCell = sheet.getCell(rowBreak, col);
+        const workCell  = sheet.getCell(rowWork,  col);
+        const extraCell = sheet.getCell(rowExtra, col);
 
-        if (cellData) {
+        if (isSunday) {
+          // Holiday — no hours are owed. Anything worked counts entirely as
+          // bonus extra; nothing is ever counted as shortfall.
+          if (cellData && cellData.lastOut) {
+            inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+            outCell.value = fmtInOutTime(cellData.lastOut, cellData.workSecs);
+            breakCell.value = secsToHoursMinutes(cellData.breakSecs);
+            workCell.value  = secsToHoursMinutes(cellData.workSecs);
+            extraCell.value = `+${secsToHoursMinutes(cellData.workSecs)} (Holiday)`;
+            totalWorkSecs  += cellData.workSecs;
+            totalBreakSecs += cellData.breakSecs;
+            totalExtraSecs += cellData.workSecs;
+          } else if (cellData) {
+            inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+            outCell.value = "—";
+            breakCell.value = workCell.value = extraCell.value = "—";
+          } else {
+            inCell.value = "Holiday";
+            outCell.value = "";
+            breakCell.value = workCell.value = extraCell.value = "—";
+          }
+        } else if (cellData) {
           inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
           outCell.value = cellData.lastOut ? fmtInOutTime(cellData.lastOut, cellData.workSecs) : "—";
-          hoursCell.value = cellData.lastOut ? secsToHoursMinutes(cellData.workSecs) : "—";
-          monthWorkSecs += cellData.workSecs;
+
+          if (cellData.lastOut) {
+            const dayExtraSecs = Math.max(0, cellData.workSecs - standardSecsPerDay);
+            const dayShortSecs = Math.max(0, standardSecsPerDay - cellData.workSecs);
+
+            breakCell.value = secsToHoursMinutes(cellData.breakSecs);
+            workCell.value  = secsToHoursMinutes(cellData.workSecs);
+            extraCell.value = dayExtraSecs > 0 ? `+${secsToHoursMinutes(dayExtraSecs)}` : "—";
+
+            totalWorkSecs      += cellData.workSecs;
+            totalBreakSecs      += cellData.breakSecs;
+            totalExtraSecs      += dayExtraSecs;
+            totalShortfallSecs  += dayShortSecs;
+          } else {
+            // Still an open/ongoing session — can't finalize the day's hours yet.
+            breakCell.value = "—";
+            workCell.value  = "—";
+            extraCell.value = "—";
+          }
         } else {
-          inCell.value  = "";
+          // Absent on a required working day — the full day counts as shortfall.
+          inCell.value  = "Absent";
           outCell.value = "";
-          hoursCell.value = "";
+          breakCell.value = "—";
+          workCell.value  = "—";
+          extraCell.value = "—";
+          totalShortfallSecs += standardSecsPerDay;
         }
 
         inCell.alignment  = { horizontal: "center" };
         outCell.alignment = { horizontal: "center" };
-        inCell.font  = { size: 9.5 };
+        inCell.font  = cellData ? { size: 9.5 } : { size: 9.5, italic: true, color: { argb: "FF9CA3AF" } };
         outCell.font = { size: 9.5 };
 
-        hoursCell.alignment = { horizontal: "center", vertical: "middle" };
-        hoursCell.font = { size: 9.5, italic: true, color: { argb: "FF15803D" } };
-        hoursCell.fill = HOURS_FILL;
+        breakCell.alignment = { horizontal: "center", vertical: "middle" };
+        breakCell.font  = { size: 9, color: { argb: "FFB91C1C" } };
+        breakCell.fill  = BREAK_FILL;
 
-        if (weekendCols.has(col))     inCell.fill  = WEEKEND_FILL;
-        if (weekendCols.has(col + 1)) outCell.fill = WEEKEND_FILL;
+        workCell.alignment = { horizontal: "center", vertical: "middle" };
+        workCell.font  = { size: 9.5, italic: true, color: { argb: "FF15803D" } };
+        workCell.fill  = HOURS_FILL;
+
+        extraCell.alignment = { horizontal: "center", vertical: "middle" };
+        extraCell.font  = { size: 9, color: { argb: "FF1D4ED8" } };
+        extraCell.fill  = EXTRA_FILL;
+
+        if (isSunday) { inCell.fill = WEEKEND_FILL; outCell.fill = WEEKEND_FILL; }
       }
 
-      // Total Working Hours for the month — merged vertically across this staff's 2 rows
-      sheet.mergeCells(rowA, TOTAL_COL, rowB, TOTAL_COL);
-      const totalCell = sheet.getCell(rowA, TOTAL_COL);
-      totalCell.value = secsToHoursMinutes(monthWorkSecs);
-      totalCell.font = { bold: true, size: 10 };
-      totalCell.alignment = { horizontal: "center", vertical: "middle" };
-      totalCell.fill = TOTAL_FILL;
+      // ── Monthly summary for this staff ──────────────────────────────────
+      // Standard target is calendar-based (working days × standard hrs/day),
+      // not based on how many days the staff actually showed up — an absent
+      // required day is already folded into totalShortfallSecs above.
+      const standardMonthlySecs = workingDaysInMonth * standardSecsPerDay;
+      // If the month fell short overall, apply the banked Extra hours toward
+      // the shortfall — capped so "Adjusted" never overshoots the target.
+      const adjustedSecs = totalWorkSecs >= standardMonthlySecs
+        ? totalWorkSecs
+        : Math.min(standardMonthlySecs, totalWorkSecs + totalExtraSecs);
+      // Extra hours left over after covering whatever shortfall existed.
+      const remainingExtraSecs = Math.max(0, totalExtraSecs - totalShortfallSecs);
+      const hasSalary = Number(staff.monthly_salary) > 0 && standardMonthlySecs > 0;
+      const payableSalary = hasSalary
+        ? Number(staff.monthly_salary) * (adjustedSecs / standardMonthlySecs)
+        : null;
 
-      [rowA, rowB].forEach((r) => {
+      const summaryValues = [
+        [COL_STANDARD,  secsToHoursMinutes(standardMonthlySecs)],
+        [COL_WORKED,    secsToHoursMinutes(totalWorkSecs)],
+        [COL_BREAK,     secsToHoursMinutes(totalBreakSecs)],
+        [COL_EXTRA,     secsToHoursMinutes(totalExtraSecs)],
+        [COL_SHORTFALL, secsToHoursMinutes(totalShortfallSecs)],
+        [COL_ADJUSTED,  secsToHoursMinutes(adjustedSecs)],
+        [COL_REMAINING_EXTRA, secsToHoursMinutes(remainingExtraSecs)],
+        [COL_SALARY,    payableSalary !== null ? fmtCurrency(payableSalary) : "—"],
+      ];
+      summaryValues.forEach(([col, value]) => {
+        sheet.mergeCells(rowIn, col, rowExtra, col);
+        const cell = sheet.getCell(rowIn, col);
+        cell.value = value;
+        cell.font = { bold: true, size: 10 };
+        cell.alignment = { horizontal: "center", vertical: "middle" };
+        cell.fill = col === COL_SALARY ? SALARY_FILL : TOTAL_FILL;
+      });
+
+      [rowIn, rowBreak, rowWork, rowExtra].forEach((r) => {
         sheet.getRow(r).eachCell({ includeEmpty: true }, (cell) => { cell.border = CELL_BORDER; });
       });
     });
 
     // Column widths
-    sheet.getColumn(NAME_COL).width = 22;
+    sheet.getColumn(NAME_COL).width   = 22;
+    sheet.getColumn(METRIC_COL).width = 10;
     for (let day = 1; day <= daysInMonth; day++) {
       const col = FIRST_DATE_COL + (day - 1) * 2;
       sheet.getColumn(col).width = 11;
       sheet.getColumn(col + 1).width = 11;
     }
-    sheet.getColumn(TOTAL_COL).width = 18;
+    [COL_STANDARD, COL_WORKED, COL_BREAK, COL_EXTRA, COL_SHORTFALL, COL_ADJUSTED, COL_REMAINING_EXTRA].forEach((col) => {
+      sheet.getColumn(col).width = 14;
+    });
+    sheet.getColumn(COL_SALARY).width = 18;
 
-    sheet.views = [{ state: "frozen", xSplit: 1, ySplit: 3 }];
+    sheet.views = [{ state: "frozen", xSplit: 2, ySplit: 3 }];
 
     const fileName = `Attendance_${monthLabel.replace(/\s+/g, "_")}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -1648,10 +1992,12 @@ const exportMonthlyAttendance = async (req, res) => {
 // GET /staff-monitor/export/attendance/daily?date=YYYY-MM-DD&staffId=<optional>
 //
 // Builds a single day's attendance sheet as an .xlsx download, using the same
-// pattern as the monthly register: each staff member gets 2 rows —
-//   Row A : Name | In Time | Out Time
-//   Row B :      | Working Hours  [merged across the In/Out columns]
-// (Name is merged vertically down across both of that staff's rows.)
+// pattern as the monthly register: each staff member gets 4 rows —
+//   Row A (In/Out)  : Name | In Time | Out Time
+//   Row B (Break)   :      | Break time    [merged across In/Out columns]
+//   Row C (Working) :      | Working hours [merged across In/Out columns]
+//   Row D (Extra)   :      | Extra hours beyond that staff's standard hours/day
+// (Name is merged vertically down across all 4 of that staff's rows.)
 // ─────────────────────────────────────────────────────────────────────────────
 const exportDailyAttendance = async (req, res) => {
   try {
@@ -1663,9 +2009,9 @@ const exportDailyAttendance = async (req, res) => {
     const staffFilter = {};
     if (req.query.staffId) staffFilter._id = req.query.staffId;
 
-    const staffList = await AdminUsersSchema.find(staffFilter, { name: 1, email: 1, role: 1 })
-      .sort({ name: 1 })
-      .lean();
+    const staffList = await AdminUsersSchema.find(staffFilter, {
+      name: 1, email: 1, role: 1, standard_hours_per_day: 1,
+    }).sort({ name: 1 }).lean();
     if (!staffList.length) return errorResponse(res, "No staff found for the given filter.");
 
     const staffIds = staffList.map((s) => s._id);
@@ -1677,16 +2023,18 @@ const exportDailyAttendance = async (req, res) => {
 
     const dateObj = new Date(`${dateParam}T00:00:00`);
     const dateLabel = dateObj.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+    const isSunday = dateObj.getDay() === 0;
     const sheet = workbook.addWorksheet(dateParam);
 
-    const NAME_COL = 1;
-    const IN_COL   = 2;
-    const OUT_COL  = 3;
+    const NAME_COL   = 1;
+    const METRIC_COL = 2;
+    const IN_COL     = 3;
+    const OUT_COL    = 4;
 
     // Title row
-    sheet.mergeCells(1, 1, 1, 3);
+    sheet.mergeCells(1, 1, 1, 4);
     const titleCell = sheet.getCell(1, 1);
-    titleCell.value = `Daily Attendance — ${dateLabel}`;
+    titleCell.value = isSunday ? `Daily Attendance — ${dateLabel} (Sunday · Holiday)` : `Daily Attendance — ${dateLabel}`;
     titleCell.font = { bold: true, size: 14 };
     titleCell.alignment = { horizontal: "center", vertical: "middle" };
     sheet.getRow(1).height = 26;
@@ -1694,9 +2042,10 @@ const exportDailyAttendance = async (req, res) => {
     // Single header row — the date itself is only ever "one column pair", so
     // (unlike the monthly sheet) there's no separate date row above it.
     const HEADER_ROW = 2;
-    sheet.getCell(HEADER_ROW, NAME_COL).value = "Name";
-    sheet.getCell(HEADER_ROW, IN_COL).value   = "In Time";
-    sheet.getCell(HEADER_ROW, OUT_COL).value  = "Out Time";
+    sheet.getCell(HEADER_ROW, NAME_COL).value   = "Name";
+    sheet.getCell(HEADER_ROW, METRIC_COL).value = "Detail";
+    sheet.getCell(HEADER_ROW, IN_COL).value     = "In Time";
+    sheet.getCell(HEADER_ROW, OUT_COL).value    = "Out Time";
     sheet.getRow(HEADER_ROW).eachCell({ includeEmpty: true }, (cell) => {
       cell.font = { bold: true, size: 11 };
       cell.alignment = { horizontal: "center", vertical: "middle" };
@@ -1705,59 +2054,112 @@ const exportDailyAttendance = async (req, res) => {
     });
 
     const DATA_START_ROW = 3;
-    const ROWS_PER_STAFF = 2; // Row A = In/Out, Row B = working hours (merged under In/Out)
+    const ROWS_PER_STAFF = 4; // Row A = In/Out, Row B = Break, Row C = Working, Row D = Extra
 
     staffList.forEach((staff, idx) => {
-      const rowA = DATA_START_ROW + idx * ROWS_PER_STAFF; // In / Out
-      const rowB = rowA + 1;                               // Working hours
+      const rowIn    = DATA_START_ROW + idx * ROWS_PER_STAFF;
+      const rowBreak = rowIn + 1;
+      const rowWork  = rowIn + 2;
+      const rowExtra = rowIn + 3;
       const sid = staff._id.toString();
       const cellData = (grid[sid] || {})[dateParam];
+      const standardSecsPerDay = (Number(staff.standard_hours_per_day) || 10) * 3600;
 
-      // Name merged vertically across this staff's 2 rows
-      sheet.mergeCells(rowA, NAME_COL, rowB, NAME_COL);
-      const nameCell = sheet.getCell(rowA, NAME_COL);
+      // Name merged vertically across this staff's 4 rows
+      sheet.mergeCells(rowIn, NAME_COL, rowExtra, NAME_COL);
+      const nameCell = sheet.getCell(rowIn, NAME_COL);
+      nameCell.value = staff.name;
       nameCell.font = { bold: true, size: 10.5 };
       nameCell.alignment = { vertical: "middle" };
 
-      const inCell  = sheet.getCell(rowA, IN_COL);
-      const outCell = sheet.getCell(rowA, OUT_COL);
+      const metricLabels = { [rowIn]: "In / Out", [rowBreak]: "Break", [rowWork]: "Working", [rowExtra]: "Extra" };
+      [rowIn, rowBreak, rowWork, rowExtra].forEach((r) => {
+        const c = sheet.getCell(r, METRIC_COL);
+        c.value = metricLabels[r];
+        c.font = { size: 9, italic: true, color: { argb: "FF6B7280" } };
+        c.alignment = { vertical: "middle" };
+      });
 
-      // Merged "working hours" cell directly below the In/Out row
-      sheet.mergeCells(rowB, IN_COL, rowB, OUT_COL);
-      const hoursCell = sheet.getCell(rowB, IN_COL);
+      const inCell  = sheet.getCell(rowIn, IN_COL);
+      const outCell = sheet.getCell(rowIn, OUT_COL);
 
-      if (cellData) {
-        nameCell.value  = staff.name;
-        inCell.value    = fmtInOutTime(cellData.firstIn, cellData.workSecs);
-        outCell.value   = cellData.lastOut ? fmtInOutTime(cellData.lastOut, cellData.workSecs) : "—";
-        hoursCell.value = cellData.lastOut ? secsToHoursMinutes(cellData.workSecs) : "—";
+      sheet.mergeCells(rowBreak, IN_COL, rowBreak, OUT_COL);
+      sheet.mergeCells(rowWork,  IN_COL, rowWork,  OUT_COL);
+      sheet.mergeCells(rowExtra, IN_COL, rowExtra, OUT_COL);
+      const breakCell = sheet.getCell(rowBreak, IN_COL);
+      const workCell  = sheet.getCell(rowWork,  IN_COL);
+      const extraCell = sheet.getCell(rowExtra, IN_COL);
+
+      if (isSunday) {
+        // Holiday — anything worked is entirely bonus; nothing is shortfall.
+        if (cellData && cellData.lastOut) {
+          inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+          outCell.value = fmtInOutTime(cellData.lastOut, cellData.workSecs);
+          inCell.font  = { size: 10.5 };
+          outCell.font = { size: 10.5 };
+          breakCell.value = secsToHoursMinutes(cellData.breakSecs);
+          workCell.value  = secsToHoursMinutes(cellData.workSecs);
+          extraCell.value = `+${secsToHoursMinutes(cellData.workSecs)} (Holiday)`;
+        } else if (cellData) {
+          inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+          outCell.value = "—";
+          inCell.font  = { size: 10.5 };
+          outCell.font = { size: 10.5 };
+          breakCell.value = workCell.value = extraCell.value = "—";
+        } else {
+          inCell.value  = "Holiday";
+          outCell.value = "";
+          inCell.font  = { size: 10.5, italic: true, color: { argb: "FF9CA3AF" } };
+          outCell.font = { size: 10.5 };
+          breakCell.value = workCell.value = extraCell.value = "—";
+        }
+      } else if (cellData) {
+        inCell.value  = fmtInOutTime(cellData.firstIn, cellData.workSecs);
+        outCell.value = cellData.lastOut ? fmtInOutTime(cellData.lastOut, cellData.workSecs) : "—";
         inCell.font  = { size: 10.5 };
         outCell.font = { size: 10.5 };
+
+        if (cellData.lastOut) {
+          const dayExtraSecs = Math.max(0, cellData.workSecs - standardSecsPerDay);
+          breakCell.value = secsToHoursMinutes(cellData.breakSecs);
+          workCell.value  = secsToHoursMinutes(cellData.workSecs);
+          extraCell.value = dayExtraSecs > 0 ? `+${secsToHoursMinutes(dayExtraSecs)}` : "—";
+        } else {
+          breakCell.value = workCell.value = extraCell.value = "—";
+        }
       } else {
-        nameCell.value  = staff.name;
         inCell.value    = "Absent";
         outCell.value   = "";
-        hoursCell.value = "";
         inCell.font  = { size: 10.5, italic: true, color: { argb: "FF9CA3AF" } };
         outCell.font = { size: 10.5 };
+        breakCell.value = workCell.value = extraCell.value = "—";
       }
 
       inCell.alignment  = { horizontal: "center", vertical: "middle" };
       outCell.alignment = { horizontal: "center", vertical: "middle" };
 
-      hoursCell.alignment = { horizontal: "center", vertical: "middle" };
-      hoursCell.font = { size: 10.5, bold: true, color: { argb: "FF15803D" } };
-      hoursCell.fill = HOURS_FILL;
+      breakCell.alignment = { horizontal: "center", vertical: "middle" };
+      breakCell.font = { size: 10, color: { argb: "FFB91C1C" } };
+      breakCell.fill = BREAK_FILL;
 
-      [rowA, rowB].forEach((r) => {
+      workCell.alignment = { horizontal: "center", vertical: "middle" };
+      workCell.font = { size: 10.5, bold: true, color: { argb: "FF15803D" } };
+      workCell.fill = HOURS_FILL;
+
+      extraCell.alignment = { horizontal: "center", vertical: "middle" };
+      extraCell.font = { size: 10, color: { argb: "FF1D4ED8" } };
+      extraCell.fill = EXTRA_FILL;
+
+      [rowIn, rowBreak, rowWork, rowExtra].forEach((r) => {
         sheet.getRow(r).eachCell({ includeEmpty: true }, (cell) => { cell.border = CELL_BORDER; });
       });
     });
 
-    sheet.getColumn(NAME_COL).width = 26;
-    sheet.getColumn(IN_COL).width   = 16;
-    sheet.getColumn(OUT_COL).width  = 16;
-    sheet.views = [{ state: "frozen", ySplit: 2 }];
+    sheet.getColumn(NAME_COL).width   = 22;
+    sheet.getColumn(METRIC_COL).width = 10;
+    sheet.getColumn(IN_COL).width     = 16;
+    sheet.getColumn(OUT_COL).width    = 16;
+    sheet.views = [{ state: "frozen", xSplit: 2, ySplit: 2 }];
 
     const fileName = `Attendance_${dateParam}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -1781,6 +2183,12 @@ module.exports = {
   // Force logout / after-hours permission / auto-logout
   forceLogout, requestPermission, getPendingPermissions,
   respondPermission, runAutoLogoutSweep,
+  // Manual login/logout time correction (super admin)
+  editSessionTime,
+  // Manually add a brand-new attendance entry (super admin)
+  createManualSession,
+  // Pay & hours settings (super admin)
+  updatePaySettings,
   // Field work (marketing "going out" with ETA)
   startFieldWork, finishFieldWork, requestFieldWorkResume,
   resumeFieldWork, closeFieldWork, getFieldWorkQueue,

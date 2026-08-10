@@ -54,6 +54,20 @@ const staffSessionSchema = new Schema(
     forced_logout_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
     forced_logout_by_name: { type: String, default: "" },
 
+    // ── Manual time correction (super admin edits login/logout on this session) ──
+    manually_edited: { type: Boolean, default: false },
+    edit_history: [
+      {
+        edited_by:      { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+        edited_by_name: { type: String, default: "" },
+        edited_at:      { type: Date, default: () => new Date() },
+        previous_login_at:  { type: Date, default: null },
+        previous_logout_at: { type: Date, default: null },
+        new_login_at:       { type: Date, default: null },
+        new_logout_at:      { type: Date, default: null },
+      },
+    ],
+
     // ── Field Work (marketing team: "going out" with an ETA) ───────────────
     // Only meaningful for staff with staff_category === "marketing".
     // Lifecycle:

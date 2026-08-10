@@ -92,6 +92,15 @@ module.exports = model(
         ref: "staff_session",
         default: null,
       },
+
+      // ── Pay & hours settings (used by the attendance Excel export) ────────
+      // The "actual"/expected working hours for this staff member per day.
+      // Used to work out daily extra (overtime) vs shortfall hours.
+      standard_hours_per_day: { type: Number, default: 10, min: 0 },
+      // Fixed monthly salary — entered manually by a super admin per staff.
+      // 0/unset means "not configured" — the export will show "—" for
+      // payable salary instead of a figure.
+      monthly_salary: { type: Number, default: 0, min: 0 },
     },
     {
       collection: "admin users",

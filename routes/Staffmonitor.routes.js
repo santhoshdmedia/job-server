@@ -8,9 +8,10 @@ const {
   startAssignedTask, stopAssignedTask, completeAssignedTask,
   requestResumeTask, resumeAssignedTask, deleteAssignedTask,
   forceLogout, requestPermission, getPendingPermissions, respondPermission,
+  editSessionTime, createManualSession, updatePaySettings,
   startFieldWork, finishFieldWork, requestFieldWorkResume,
   resumeFieldWork, closeFieldWork, getFieldWorkQueue,
-  exportMonthlyAttendance,exportDailyAttendance
+  exportMonthlyAttendance, exportDailyAttendance,
 } = require("../controller/Staffmonitor.controller");
 const { VerfiyToken } = require("../helper/shared.helper");
 const AdminUsersSchema = require("../modals/adminusers.modals");
@@ -32,11 +33,7 @@ const attachUser = async (req, res, next) => {
   }
 };
 
-const requireSuperAdmin = (req, res, next) => {
-  const role = req.user?.role?.toLowerCase?.() ?? "";
-  if (["super_admin", "super admin", "admin"].includes(role)) return next();
-  return res.status(403).json({ success: false, message: "Admin access required." });
-};
+
 
 // Every route below requires a logged-in user.
 router.use(VerfiyToken, attachUser);
@@ -50,12 +47,24 @@ router.post("/session/break/end",   endBreak);
 
 // Force-logout — super admin closes out a staff member's session
 // (e.g. they forgot to log out, app crashed, left a tab open overnight).
-router.post("/session/force-logout", requireSuperAdmin, forceLogout);
+router.post("/session/force-logout",  forceLogout);
+
+// Manual login/logout time correction — super admin only.
+// PATCH /staff-monitor/session/:sessionId/edit-time  body: { login_at, logout_at? }
+router.patch("/session/:sessionId/edit-time",  editSessionTime);
+
+// Manually add a brand-new attendance entry — super admin only.
+// POST /staff-monitor/session/manual-entry  body: { staffId, login_at, logout_at? }
+router.post("/session/manual-entry",  createManualSession);
+
+// Pay & hours settings — super admin only.
+// PATCH /staff-monitor/staff/:staffId/pay-settings  body: { standard_hours_per_day?, monthly_salary? }
+router.patch("/staff/:staffId/pay-settings",  updatePaySettings);
 
 // After-7-PM work permission
 router.post("/session/permission/request",            requestPermission);         // staff asks to keep working late
-router.get ("/session/permission/pending",             requireSuperAdmin, getPendingPermissions); // admin sees queue
-router.post("/session/permission/:staffId/respond",    requireSuperAdmin, respondPermission);      // admin approves/rejects
+router.get ("/session/permission/pending",              getPendingPermissions); // admin sees queue
+router.post("/session/permission/:staffId/respond",     respondPermission);      // admin approves/rejects
 
 // ── Field Work — marketing team "going out" with an estimated-hours ETA ───
 // Staff-initiated: start / finish-early / request-resume-when-frozen.
@@ -64,9 +73,9 @@ router.post("/session/field-work/finish",          finishFieldWork);
 router.post("/session/field-work/resume-request",  requestFieldWorkResume);
 // Admin-only: see who's frozen/waiting, resume them (optionally granting
 // more hours), or force-close their window instead.
-router.get ("/session/field-work/pending",          requireSuperAdmin, getFieldWorkQueue);
-router.post("/session/field-work/:staffId/resume",  requireSuperAdmin, resumeFieldWork);
-router.post("/session/field-work/:staffId/close",   requireSuperAdmin, closeFieldWork);
+router.get ("/session/field-work/pending",           getFieldWorkQueue);
+router.post("/session/field-work/:staffId/resume",   resumeFieldWork);
+router.post("/session/field-work/:staffId/close",    closeFieldWork);
 
 // Monitor — admin dashboard
 router.get("/monitor",               getMonitorList);
@@ -75,10 +84,11 @@ router.get("/monitor/:id/job-time",  getStaffJobTime);
 
 // Attendance export — month-wise, date-wise in/out register as .xlsx
 // GET /staff-monitor/export/attendance?month=YYYY-MM&staffId=<optional>
-router.get("/export/attendance", exportMonthlyAttendance);
-router.get("/export/attendance/daily", exportDailyAttendance);
+router.get("/export/attendance",  exportMonthlyAttendance);
 
-
+// Attendance export — single day's in/out + working hours as .xlsx
+// GET /staff-monitor/export/attendance/daily?date=YYYY-MM-DD&staffId=<optional>
+router.get("/export/attendance/daily",  exportDailyAttendance);
 
 // Task logs
 router.post  ("/task-log",         submitTaskLog);
@@ -86,10 +96,10 @@ router.delete("/task-log/:logId",   deleteTaskLog);
 
 // ── Assigned Tasks (stock-checking style jobs assigned by admin) ──────────
 // Admin creates/oversees assignments
-router.post  ("/assigned-tasks",                        requireSuperAdmin, assignTask);
-router.get   ("/assigned-tasks",                         requireSuperAdmin, getAllAssignedTasks); // ?status=resume_requested etc.
-router.delete("/assigned-tasks/:taskId",                 requireSuperAdmin, deleteAssignedTask);
-router.post  ("/assigned-tasks/:taskId/resume",          requireSuperAdmin, resumeAssignedTask); // only super admin can resume a stopped task
+router.post  ("/assigned-tasks",                         assignTask);
+router.get   ("/assigned-tasks",                          getAllAssignedTasks); // ?status=resume_requested etc.
+router.delete("/assigned-tasks/:taskId",                  deleteAssignedTask);
+router.post  ("/assigned-tasks/:taskId/resume",           resumeAssignedTask); // only super admin can resume a stopped task
 
 // Staff acts on their own tasks
 router.get   ("/assigned-tasks/staff/:staffId",          getAssignedTasksForStaff);

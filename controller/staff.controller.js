@@ -61,7 +61,7 @@ const getSingleStaff = async (req, res) => {
 // POST /api/staff
 const createStaff = async (req, res) => {
   try {
-    const { name, email, phone, password, role, profileImg, pagePermissions, staff_category } = req.body;
+    const { name, email, phone, password, role, profileImg, pagePermissions, staff_category, working_hours_per_day, salary } = req.body;
 
     if (!name || !email || !phone || !password || !role)
       return err(res, "name, email, phone, password and role are required", 400);
@@ -80,6 +80,9 @@ const createStaff = async (req, res) => {
       profileImg: profileImg || "",
       pagePermissions: pagePermissions || [],
       staff_category: staff_category === "marketing" ? "marketing" : "office",
+      // Custom working hours (default 10/day) and manually-entered salary.
+      working_hours_per_day: working_hours_per_day && Number(working_hours_per_day) > 0 ? Number(working_hours_per_day) : 10,
+      salary: salary && Number(salary) > 0 ? Number(salary) : 0,
     });
 
     const result = staff.toObject();
@@ -164,6 +167,49 @@ const updatePermissions = async (req, res) => {
   }
 };
 
+// ─── SET salary (manual entry, super admin only) ──────────────────────────────
+// PATCH /api/staff/:id/salary   body: { salary }
+const updateSalary = async (req, res) => {
+  try {
+    const { salary } = req.body;
+    if (salary === undefined || salary === null || isNaN(Number(salary)) || Number(salary) < 0)
+      return err(res, "A valid, non-negative salary is required", 400);
+
+    const updated = await AdminUser
+      .findByIdAndUpdate(req.params.id, { salary: Number(salary) }, { new: true, runValidators: true })
+      .select("-password")
+      .lean();
+
+    if (!updated) return err(res, "Staff not found", 404);
+    return ok(res, updated, "Salary updated successfully");
+  } catch (e) {
+    console.error("updateSalary:", e);
+    return err(res);
+  }
+};
+
+// ─── SET custom working hours per day (default 10) ────────────────────────────
+// PATCH /api/staff/:id/working-hours   body: { working_hours_per_day }
+const updateWorkingHours = async (req, res) => {
+  try {
+    const { working_hours_per_day } = req.body;
+    const hours = Number(working_hours_per_day);
+    if (working_hours_per_day === undefined || working_hours_per_day === null || isNaN(hours) || hours <= 0)
+      return err(res, "A valid, positive working_hours_per_day is required", 400);
+
+    const updated = await AdminUser
+      .findByIdAndUpdate(req.params.id, { working_hours_per_day: hours }, { new: true, runValidators: true })
+      .select("-password")
+      .lean();
+
+    if (!updated) return err(res, "Staff not found", 404);
+    return ok(res, updated, "Working hours updated successfully");
+  } catch (e) {
+    console.error("updateWorkingHours:", e);
+    return err(res);
+  }
+};
+
 module.exports = {
   getAllStaff,
   getSingleStaff,
@@ -172,4 +218,6 @@ module.exports = {
   deleteStaff,
   toggleAvailable,
   updatePermissions,
+  updateSalary,
+  updateWorkingHours,
 };
