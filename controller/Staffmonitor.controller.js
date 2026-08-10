@@ -9,6 +9,30 @@
  *   in_progress -> stop (notes required) -> stopped
  *   stopped -> request-resume -> resume_requested -> (admin) resume -> in_progress
  *   stopped -> (admin) resume -> in_progress   [admin can bypass the request]
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * TIMEZONE FIX (2026-08-10)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Every place that turns a stored Date into a clock time or a "YYYY-MM-DD"
+ * bucket now goes through `toIST()` and reads back UTC-getters
+ * (getUTCHours/getUTCMinutes/getUTCDate/...) instead of the local
+ * getHours()/getMinutes()/toLocaleString()/toISOString() family.
+ *
+ * Why: getHours()/getMinutes()/toLocaleDateString() all depend on the
+ * *server process's* OS/TZ setting. A dev laptop set to IST and a VPS
+ * running in UTC (the default on almost every cloud image) will render the
+ * exact same stored timestamp 5.5 hours apart — which is exactly the bug
+ * that was showing up in the attendance Excel export (VPS: 3:53 AM vs
+ * local: 9:23 AM for the same login).
+ *
+ * `toIST(d)` manually shifts the timestamp by the IST offset in
+ * milliseconds and every reader then uses the UTC getters on that shifted
+ * value — this bypasses the server's local TZ entirely, so the app renders
+ * identically no matter where it's deployed. This pattern already existed
+ * for `isPastAutoLogoutTime` — it's now applied consistently everywhere
+ * else a time or date is displayed/bucketed (todayStr, fmtClockTime,
+ * fmtDateTime, submitTaskLog's hour_label).
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
 const axios = require("axios");
@@ -51,6 +75,9 @@ const computeAutoLogoutHour = () => {
 
 const AUTO_LOGOUT_HOUR = computeAutoLogoutHour();
 
+// Shift a Date by the IST offset. Every reader of the result MUST use the
+// UTC getters (getUTCHours, getUTCMinutes, getUTCDate, ...) — never the
+// local getters — otherwise the server's own OS timezone leaks back in.
 const toIST = (d = new Date()) => new Date(d.getTime() + IST_OFFSET_MS);
 
 // ⚠️ BUG FIX ⚠️
@@ -127,13 +154,62 @@ const syncFieldWorkFreeze = async (session, staffId, now = new Date()) => {
 };
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
-const todayStr  = () => new Date().toISOString().slice(0, 10);
+// Zero-pad a number to 2 digits — moved up here (was previously declared
+// much further down, near the Excel export code) because todayStr() now
+// needs it too.
+const pad2 = (n) => String(n).padStart(2, "0");
+
+// ⚠️ BUG FIX ⚠️
+// This used to be `new Date().toISOString().slice(0, 10)`, which is ALWAYS
+// UTC regardless of the server's local timezone. A login at, say, 12:30 AM
+// IST (= 7:00 PM UTC the previous day) would get bucketed under YESTERDAY's
+// date — silently shifting attendance records across a day boundary. Now it
+// explicitly buckets by the IST calendar day, independent of server TZ.
+const todayStr = () => {
+  const ist = toIST(new Date());
+  return `${ist.getUTCFullYear()}-${pad2(ist.getUTCMonth() + 1)}-${pad2(ist.getUTCDate())}`;
+};
+
 const secsToDisplay = (total) => {
   const s   = Math.max(0, Math.floor(total));
   const h   = String(Math.floor(s / 3600)).padStart(2, "0");
   const m   = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
   const sec = String(s % 60).padStart(2, "0");
   return `${h}:${m}:${sec}`;
+};
+
+// Month abbreviations used by fmtDateTime — avoids toLocaleDateString(),
+// which (like getHours/getMinutes) depends on the server's local timezone.
+const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// ⚠️ BUG FIX ⚠️
+// Was `dt.getHours()` / `dt.getMinutes()` — server-local-timezone dependent.
+// This is the function that was actually producing the mismatched
+// screenshots (VPS showing UTC clock times, local showing IST clock times
+// for the identical stored timestamp). Now routes through toIST() + the
+// UTC getters, same pattern as isPastAutoLogoutTime, so it renders
+// identically regardless of the server's OS/TZ setting.
+const fmtClockTime = (d) => {
+  if (!d) return "";
+  const ist = toIST(new Date(d));
+  let h = ist.getUTCHours();
+  const m = ist.getUTCMinutes();
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${pad2(m)} ${ampm}`;
+};
+
+// Same as fmtClockTime, but prefixes the date (e.g. "Jul 1, 9:00 AM").
+// Used when a session's working hours run past 24h, so the sheet doesn't
+// silently show a bare time that could belong to a different calendar day.
+// ⚠️ BUG FIX ⚠️ — was using dt.toLocaleDateString(), also server-TZ
+// dependent. Now derives the IST calendar date from toIST() directly.
+const fmtDateTime = (d) => {
+  if (!d) return "";
+  const ist = toIST(new Date(d));
+  const datePart = `${MONTH_SHORT[ist.getUTCMonth()]} ${ist.getUTCDate()}`;
+  return `${datePart}, ${fmtClockTime(d)}`; // pass the raw value; fmtClockTime re-applies the IST shift itself
 };
 
 const reverseGeocode = async (lat, lng) => {
@@ -381,8 +457,12 @@ const editSessionTime = async (req, res) => {
 
     session.login_at = newLogin;
     // Keep the "date" bucket (used by the monitor list and exports) in sync
-    // with the corrected login time so it lands on the right day.
-    session.date = newLogin.toISOString().slice(0, 10);
+    // with the corrected login time so it lands on the right day. Bucketed
+    // by IST calendar day, same rule as todayStr().
+    {
+      const ist = toIST(newLogin);
+      session.date = `${ist.getUTCFullYear()}-${pad2(ist.getUTCMonth() + 1)}-${pad2(ist.getUTCDate())}`;
+    }
 
     if (newLogout) {
       session.logout_at        = newLogout;
@@ -461,9 +541,12 @@ const createManualSession = async (req, res) => {
     const working_seconds  = newLogout ? duration_seconds : 0;
     const overtime_seconds = newLogout ? Math.max(0, working_seconds - STANDARD_WORK_SECONDS) : 0;
 
+    const ist = toIST(newLogin);
+    const dateStr = `${ist.getUTCFullYear()}-${pad2(ist.getUTCMonth() + 1)}-${pad2(ist.getUTCDate())}`;
+
     const session = await StaffSession.create({
       staff_id: staffId,
-      date: newLogin.toISOString().slice(0, 10),
+      date: dateStr,
       login_at: newLogin,
       logout_at: newLogout,
       duration_seconds,
@@ -1363,7 +1446,10 @@ const submitTaskLog = async (req, res) => {
     if (!staffId)         return errorResponse(res, "staffId is required.");
     if (!message?.trim()) return errorResponse(res, "message is required.");
     const now   = new Date();
-    const label = hour_label || now.toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit", hour12:true });
+    // ⚠️ BUG FIX ⚠️ — was now.toLocaleTimeString("en-IN", {...}) with no
+    // explicit timeZone, so it silently used the server's local TZ. Route
+    // through the shared, TZ-safe fmtClockTime() instead.
+    const label = hour_label || fmtClockTime(now);
     const log   = await StaffTaskLog.create({ staff_id: staffId, message: message.trim(), job_ref: job_ref?.trim() || "", hour_label: label, submitted_at: now, submitted_by: req.user?._id || null });
     return successResponse(res, "Task log submitted.", log);
   } catch (err) {
@@ -1599,29 +1685,11 @@ const deleteAssignedTask = async (req, res) => {
 // target, the Extra hours banked on other days are applied to make up the
 // difference — the result is "Adjusted Hrs". Payable Salary is the staff's
 // monthly_salary prorated by (Adjusted Hrs / Standard Hrs).
+//
+// NOTE: fmtClockTime / fmtDateTime (used throughout this export) are defined
+// once near the top "Utilities" section and are IST-safe — see the
+// TIMEZONE FIX note at the top of this file.
 // ─────────────────────────────────────────────────────────────────────────────
-const pad2 = (n) => String(n).padStart(2, "0");
-
-const fmtClockTime = (d) => {
-  if (!d) return "";
-  const dt = new Date(d);
-  let h = dt.getHours();
-  const m = dt.getMinutes();
-  const ampm = h >= 12 ? "PM" : "AM";
-  h = h % 12;
-  if (h === 0) h = 12;
-  return `${h}:${pad2(m)} ${ampm}`;
-};
-
-// Same as fmtClockTime, but prefixes the date (e.g. "Jul 1, 9:00 AM").
-// Used when a session's working hours run past 24h, so the sheet doesn't
-// silently show a bare time that could belong to a different calendar day.
-const fmtDateTime = (d) => {
-  if (!d) return "";
-  const dt = new Date(d);
-  const datePart = dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-  return `${datePart}, ${fmtClockTime(dt)}`;
-};
 
 const DAY_SECONDS = 24 * 3600;
 
