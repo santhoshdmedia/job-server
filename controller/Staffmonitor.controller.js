@@ -2248,18 +2248,12 @@ module.exports = {
   assignTask, getAssignedTasksForStaff, getAllAssignedTasks,
   startAssignedTask, stopAssignedTask, completeAssignedTask,
   requestResumeTask, resumeAssignedTask, deleteAssignedTask,
-  // Force logout / after-hours permission / auto-logout
   forceLogout, requestPermission, getPendingPermissions,
   respondPermission, runAutoLogoutSweep,
-  // Manual login/logout time correction (super admin)
   editSessionTime,
-  // Manually add a brand-new attendance entry (super admin)
   createManualSession,
-  // Pay & hours settings (super admin)
   updatePaySettings,
-  // Field work (marketing "going out" with ETA)
   startFieldWork, finishFieldWork, requestFieldWorkResume,
   resumeFieldWork, closeFieldWork, getFieldWorkQueue,
-  // Attendance export
   exportMonthlyAttendance, exportDailyAttendance,
 };

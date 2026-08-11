@@ -16,7 +16,7 @@ const staffMonitor =require('./Staffmonitor.routes')
 
 module.exports = {
   auth_routes,
-  admin_routers,
+  admin_routers, 
   job_routers,
   product_routers,
   staff_routers,
