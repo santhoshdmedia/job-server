@@ -6,6 +6,31 @@ const _ = require("lodash");
 const ok  = (res, data, msg = "Success")        => res.status(200).json({ success: true,  message: msg,  data });
 const err = (res, msg  = "Something went wrong", code = 500) => res.status(code).json({ success: false, message: msg });
 
+const sanitizePagePermissions = (perms) => {
+  if (!Array.isArray(perms)) return [];
+  return perms
+    .filter((p) => p && typeof p === "object" && p.pageName)
+    .map((p) => ({
+      pageName: String(p.pageName).trim(),
+      canView: Boolean(p.canView || p.canEdit || p.canDelete),
+      canEdit: Boolean(p.canEdit),
+      canDelete: Boolean(p.canDelete),
+    }));
+};
+
+const sanitizeActionPermissions = (perms) => {
+  if (!Array.isArray(perms)) return [];
+  return perms
+    .filter((a) => typeof a === "string" && a.trim().length > 0)
+    .map((a) => a.trim());
+};
+
+const cleanPhone = (phone) => {
+  if (phone === undefined || phone === null) return 0;
+  const num = Number(String(phone).replace(/\D/g, ""));
+  return isNaN(num) ? 0 : num;
+};
+
 // ─── GET all staff ────────────────────────────────────────────────────────────
 // GET /api/staff
 const getAllStaff = async (req, res) => {
@@ -74,12 +99,12 @@ const createStaff = async (req, res) => {
     const staff = await AdminUser.create({
       name,
       email,
-      phone,
+      phone: cleanPhone(phone),
       password: hashed,
       role,
       profileImg: profileImg || "",
-      pagePermissions: pagePermissions || [],
-      actionPermissions: actionPermissions || [],
+      pagePermissions: sanitizePagePermissions(pagePermissions),
+      actionPermissions: sanitizeActionPermissions(actionPermissions),
       staff_category: staff_category === "marketing" ? "marketing" : "office",
       // Custom working hours (default 10/day) and manually-entered salary.
       working_hours_per_day: working_hours_per_day && Number(working_hours_per_day) > 0 ? Number(working_hours_per_day) : 10,
@@ -91,7 +116,7 @@ const createStaff = async (req, res) => {
     return ok(res, result, "Staff created successfully");
   } catch (e) {
     console.error("createStaff:", e);
-    return err(res);
+    return err(res, e.message || "Failed to create staff");
   }
 };
 
@@ -106,6 +131,16 @@ const updateStaff = async (req, res) => {
       rest.password = await bcrypt.hash(password, 10);
     }
 
+    if (rest.pagePermissions !== undefined) {
+      rest.pagePermissions = sanitizePagePermissions(rest.pagePermissions);
+    }
+    if (rest.actionPermissions !== undefined) {
+      rest.actionPermissions = sanitizeActionPermissions(rest.actionPermissions);
+    }
+    if (rest.phone !== undefined) {
+      rest.phone = cleanPhone(rest.phone);
+    }
+
     const updated = await AdminUser
       .findByIdAndUpdate(req.params.id, rest, { new: true, runValidators: true })
       .select("-password")
@@ -115,7 +150,7 @@ const updateStaff = async (req, res) => {
     return ok(res, updated, "Staff updated successfully");
   } catch (e) {
     console.error("updateStaff:", e);
-    return err(res);
+    return err(res, e.message || "Failed to update staff");
   }
 };
 
@@ -152,10 +187,10 @@ const updatePermissions = async (req, res) => {
     const { pagePermissions, actionPermissions } = req.body;
     const update = {};
     if (Array.isArray(pagePermissions)) {
-      update.pagePermissions = pagePermissions;
+      update.pagePermissions = sanitizePagePermissions(pagePermissions);
     }
     if (Array.isArray(actionPermissions)) {
-      update.actionPermissions = actionPermissions;
+      update.actionPermissions = sanitizeActionPermissions(actionPermissions);
     }
 
     const updated = await AdminUser
@@ -167,7 +202,7 @@ const updatePermissions = async (req, res) => {
     return ok(res, updated, "Permissions updated");
   } catch (e) {
     console.error("updatePermissions:", e);
-    return err(res);
+    return err(res, e.message || "Failed to update permissions");
   }
 };
 

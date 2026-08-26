@@ -1014,24 +1014,102 @@ exports.updatePickupStatus = async (req, res) => {
           const Job = require("../modals/job.modal");
           const job = await Job.findById(issue.job_id);
           if (job && !["quality_check", "delivery", "completed"].includes(job.job_status)) {
-            job.job_status = "quality_check";
-            job.current_stage = {
-              stage: "quality_check",
-              stage_label: "Quality Check",
-              stage_action: "pending",
-              assigned_to: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
-              since: new Date(),
-            };
-            job.workflow_stages.push({
-              stage: "quality_check",
-              stage_label: "Quality Check",
-              handled_by: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
-              assigned_by: { user_id: null, name: "Pickup Delivery" },
-              action: "assigned",
-              assigned_at: new Date(),
-              notes: `Outsource pickup delivered by ${received_by || "staff"}. Job forwarded to Quality Check.`,
+            // Find all active material issues for this job
+            const allJobIssues = await MaterialIssue.find({
+              job_id: issue.job_id,
+              is_deleted: false,
             });
-            await job.save();
+
+            // 1. Check all outsource issues for this job
+            // Make sure current issue is treated as delivered
+            const outsourceIssues = allJobIssues.filter((i) => i.calc_mode === "outsource");
+            const allOutsourceDelivered = outsourceIssues.every((i) => {
+              if (String(i._id) === String(issue._id)) return true;
+              return i.pickup_assignment?.status === "delivered";
+            });
+
+            // 2. Check in-house items/files for this job
+            let hasPendingInHouse = false;
+            if (job.material_needed !== false) {
+              const NO_MATERIAL_LABELS = ["Cutting File"];
+              const cartItems = job.cart_items || [];
+
+              for (let itemIdx = 0; itemIdx < cartItems.length; itemIdx++) {
+                const item = cartItems[itemIdx];
+                const isItemOutsource =
+                  item.outsource_type &&
+                  item.outsource_type !== "none" &&
+                  item.outsource_type !== "inhouse";
+
+                if (isItemOutsource) continue;
+
+                const files = (item.design_files && item.design_files.length > 0)
+                  ? item.design_files
+                  : [{ _id: null, label: "Other", assigned_to: item.issued_to }];
+
+                for (const file of files) {
+                  if (NO_MATERIAL_LABELS.includes(file?.label)) continue;
+
+                  const isFileOutsource =
+                    file?.assigned_to?.role === "outsource" ||
+                    file?.assigned_to?.name?.toLowerCase() === "outsource";
+
+                  if (isFileOutsource) continue;
+
+                  // This is an in-house required task. Find matching material issue:
+                  const matchingIssue = allJobIssues.find((iss) => {
+                    if (iss.calc_mode === "outsource") return false;
+                    if (file._id) {
+                      return String(iss.design_file_id || "") === String(file._id);
+                    }
+                    return (
+                      !iss.design_file_id &&
+                      Number(iss.cart_item_index) === Number(itemIdx)
+                    );
+                  });
+
+                  if (!matchingIssue || matchingIssue.production_status !== "completed") {
+                    hasPendingInHouse = true;
+                    break;
+                  }
+                }
+                if (hasPendingInHouse) break;
+              }
+            }
+
+            if (allOutsourceDelivered && !hasPendingInHouse) {
+              job.job_status = "quality_check";
+              job.current_stage = {
+                stage: "quality_check",
+                stage_label: "Quality Check",
+                stage_action: "pending",
+                assigned_to: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
+                since: new Date(),
+              };
+              job.workflow_stages.push({
+                stage: "quality_check",
+                stage_label: "Quality Check",
+                handled_by: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
+                assigned_by: { user_id: null, name: "Pickup Delivery" },
+                action: "assigned",
+                assigned_at: new Date(),
+                notes: `All outsource pickups delivered and in-house production complete. Job forwarded to Quality Check.`,
+              });
+              await job.save();
+            } else {
+              // In-house tasks or other outsource items are still pending.
+              // Keep job in current status (production) and log workflow note.
+              job.workflow_stages.push({
+                stage: job.job_status || "production",
+                stage_label: "Outsource Pickup Delivered",
+                handled_by: { user_id: null, name: received_by || "Pickup Staff" },
+                assigned_by: { user_id: null, name: "Pickup Delivery" },
+                action: "outsource_delivered",
+                assigned_at: new Date(),
+                notes: `Outsource pickup for ${issue.issue_no} (${issue.cart_item_name || "Item"}) delivered by ${received_by || "staff"}. Waiting for remaining in-house production / items.`,
+              });
+              await job.save();
+            }
           }
         } catch (jobErr) {
           console.error("Error updating job stage on pickup delivery:", jobErr);

@@ -10,9 +10,11 @@ const ROLE_ACTION_DEFAULTS = {
   "designing head": ["assign_designer", "approve_design", "create_job"],
   "designing team": ["approve_design", "assign_designer"],
   "production team": ["start_production", "assign_production", "issue_material", "store_material_allocation"],
+  "store manager": ["store_material_allocation", "issue_material", "assign_production"],
   "quality check": ["qc"],
   "delivery team": ["delivery", "complete_job"],
   "accounting team": ["create_job", "approve_job", "delivery"],
+  "packing team": [],
 };
 
 /**
@@ -104,7 +106,13 @@ const requirePagePermission = (pageName, accessType = "canView") => {
       const targetPage = (pageName || "").toLowerCase().trim();
       const pagePerm = pagePerms.find((p) => (p.pageName || "").toLowerCase().trim() === targetPage);
 
-      if (pagePerm && pagePerm[accessType]) {
+      const hasAccess = pagePerm && (
+        accessType === "canView"
+          ? Boolean(pagePerm.canView || pagePerm.canEdit || pagePerm.canDelete)
+          : Boolean(pagePerm[accessType])
+      );
+
+      if (hasAccess) {
         return next();
       }
 

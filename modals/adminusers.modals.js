@@ -54,7 +54,8 @@ module.exports = model(
           "packing team",
           "delivery team",
           "admin",
-          "designing head"
+          "designing head",
+          "store manager"
         ],
         required: true,
       },

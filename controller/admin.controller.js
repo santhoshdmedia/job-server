@@ -65,17 +65,17 @@ const AVAILABLE_PAGES = [
 // Role-based default page access
 // ─────────────────────────────────────────────
 const ROLE_DEFAULT_PAGES = {
-  "super admin":    null, // handled separately — full access
-  "Frontend admin": ["dashboard", "BNI", "vendors"],
-  "accounting team":  ["dashboard", "orders", "settings"],
-  "designing team":   ["dashboard", "orders", "settings", "admin-designer-job-dashboard", "my-jobs", "my-tasks"],
-  // BUG FIX: production team had no route to the actual Production Upload
-  // Panel in its default permissions, only unrelated e-commerce pages.
-  "production team":  ["dashboard", "orders", "settings", "production-panel", "material-issue-manager", "my-jobs", "my-tasks"],
-  "quality check":    ["orders", "settings", "quality-check-dashboard", "my-jobs", "my-tasks"],
-  "packing team":     ["orders"],
-  "delivery team":    ["dashboard", "orders", "settings", "delivery-panel", "pickup-dashboard", "my-jobs", "my-tasks"],
-  "admin":null
+  "super admin":      null, // handled separately — full access
+  "admin":            null, // handled separately — full access
+  "Frontend admin":   ["dashboard", "BNI", "vendors"],
+  "accounting team":  ["dashboard", "admin-job-management", "my-jobs", "my-tasks"],
+  "designing head":   ["dashboard", "admin-designer-job-dashboard", "admin-job-management", "site-visit-dashboard", "my-jobs", "my-tasks"],
+  "designing team":   ["dashboard", "admin-designer-job-dashboard", "site-visit-dashboard", "my-jobs", "my-tasks"],
+  "production team":  ["dashboard", "production-panel", "material-issue-manager", "my-jobs", "my-tasks"],
+  "store manager":    ["dashboard", "material-issue-manager", "production-panel", "my-jobs", "my-tasks"],
+  "quality check":    ["dashboard", "quality-check-dashboard", "my-jobs", "my-tasks"],
+  "packing team":     ["dashboard", "production-panel", "my-jobs", "my-tasks"],
+  "delivery team":    ["dashboard", "delivery-panel", "pickup-dashboard", "erection-panel", "my-jobs", "my-tasks"],
 };
 
 // ─────────────────────────────────────────────
@@ -83,7 +83,7 @@ const ROLE_DEFAULT_PAGES = {
 // ─────────────────────────────────────────────
 const getDefaultPermissionsForRole = (role) => {
   // Super admin → full access to all pages
-  if (role === "super admin"||role === "admin") {
+  if (role === "super admin" || role === "admin") {
     return AVAILABLE_PAGES.map((page) => ({
       pageName:  page.value,
       canView:   true,
@@ -124,9 +124,11 @@ const getDefaultActionsForRole = (role) => {
     "designing head": ["assign_designer", "approve_design", "create_job"],
     "designing team": ["approve_design", "assign_designer"],
     "production team": ["start_production", "assign_production", "issue_material", "store_material_allocation"],
+    "store manager": ["store_material_allocation", "issue_material", "assign_production"],
     "quality check": ["qc"],
     "delivery team": ["delivery", "complete_job"],
     "accounting team": ["create_job", "approve_job", "delivery"],
+    "packing team": [],
   };
   return roleDefaults[role] || [];
 };
