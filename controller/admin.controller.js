@@ -102,6 +102,35 @@ const getDefaultPermissionsForRole = (role) => {
   }));
 };
 
+const AVAILABLE_ACTIONS = [
+  { name: "Create Job", value: "create_job" },
+  { name: "Approve Job", value: "approve_job" },
+  { name: "Assign Designer", value: "assign_designer" },
+  { name: "Verify/Approve Design", value: "approve_design" },
+  { name: "Assign Production", value: "assign_production" },
+  { name: "Store Material Allocation", value: "store_material_allocation" },
+  { name: "Issue Material", value: "issue_material" },
+  { name: "Start Production", value: "start_production" },
+  { name: "QC (Quality Check)", value: "qc" },
+  { name: "Delivery", value: "delivery" },
+  { name: "Complete Job", value: "complete_job" },
+];
+
+const getDefaultActionsForRole = (role) => {
+  if (role === "super admin" || role === "admin") {
+    return AVAILABLE_ACTIONS.map(a => a.value);
+  }
+  const roleDefaults = {
+    "designing head": ["assign_designer", "approve_design", "create_job"],
+    "designing team": ["approve_design", "assign_designer"],
+    "production team": ["start_production", "assign_production", "issue_material", "store_material_allocation"],
+    "quality check": ["qc"],
+    "delivery team": ["delivery", "complete_job"],
+    "accounting team": ["create_job", "approve_job", "delivery"],
+  };
+  return roleDefaults[role] || [];
+};
+
 // ─────────────────────────────────────────────
 // Helper: Strip sensitive fields from a user object
 // ─────────────────────────────────────────────
@@ -115,7 +144,7 @@ const sanitizeUser = (userDoc) => {
 // POST /admin-users  →  Add new admin user
 // ─────────────────────────────────────────────
 const addAdmin = async (req, res) => {
-  const { email, password, name, role, phone, pagePermissions } = req.body;
+  const { email, password, name, role, phone, pagePermissions, actionPermissions } = req.body;
 
   try {
     // Validate required fields
@@ -135,6 +164,11 @@ const addAdmin = async (req, res) => {
         ? pagePermissions
         : getDefaultPermissionsForRole(role);
 
+    const finalActionPermissions =
+      actionPermissions && actionPermissions.length > 0
+        ? actionPermissions
+        : getDefaultActionsForRole(role);
+
     const newUser = new AdminUsersSchema({
       email,
       password: await EncryptPassword(password),
@@ -142,6 +176,7 @@ const addAdmin = async (req, res) => {
       role,
       phone,
       pagePermissions: finalPagePermissions,
+      actionPermissions: finalActionPermissions,
     });
 
     const savedUser = await newUser.save();
@@ -172,7 +207,7 @@ const getAdmin = async (req, res) => {
 const updateAdmin = async (req, res) => {
   try {
     const { id } = req.params;
-    const { email, password, pagePermissions, ...rest } = req.body;
+    const { email, password, pagePermissions, actionPermissions, ...rest } = req.body;
 
     // Check if email is being taken by another user
     if (email) {
@@ -194,6 +229,11 @@ const updateAdmin = async (req, res) => {
     // Update page permissions if provided
     if (pagePermissions && pagePermissions.length > 0) {
       rest.pagePermissions = pagePermissions;
+    }
+
+    // Update action permissions if provided
+    if (Array.isArray(actionPermissions)) {
+      rest.actionPermissions = actionPermissions;
     }
 
     const updated = await AdminUsersSchema.findByIdAndUpdate(
@@ -232,9 +272,6 @@ const deleteAdmin = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────
-// GET /admin-users/pages  →  List all available pages
-// ─────────────────────────────────────────────
 const getAvailablePages = async (req, res) => {
   try {
     return successResponse(res, "Pages fetched successfully", AVAILABLE_PAGES);
@@ -244,10 +281,25 @@ const getAvailablePages = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────
+// GET /admin-users/actions  →  List all available workflow actions
+// ─────────────────────────────────────────────
+const getAvailableActions = async (req, res) => {
+  try {
+    return successResponse(res, "Actions fetched successfully", AVAILABLE_ACTIONS);
+  } catch (error) {
+    console.error("[getAvailableActions]", error);
+    return errorResponse(res, "Failed to fetch actions");
+  }
+};
+
 module.exports = {
   addAdmin,
   getAdmin,
   deleteAdmin,
   updateAdmin,
   getAvailablePages,
+  getAvailableActions,
+  AVAILABLE_ACTIONS,
+  AVAILABLE_PAGES,
 };

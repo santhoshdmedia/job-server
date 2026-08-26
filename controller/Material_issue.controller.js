@@ -1008,6 +1008,35 @@ exports.updatePickupStatus = async (req, res) => {
     if (status === "delivered") {
       if (received_by)      issue.pickup_assignment.received_by      = received_by;
       if (receiver_mobile)  issue.pickup_assignment.receiver_mobile   = receiver_mobile;
+
+      if (issue.job_id) {
+        try {
+          const Job = require("../modals/job.modal");
+          const job = await Job.findById(issue.job_id);
+          if (job && !["quality_check", "delivery", "completed"].includes(job.job_status)) {
+            job.job_status = "quality_check";
+            job.current_stage = {
+              stage: "quality_check",
+              stage_label: "Quality Check",
+              stage_action: "pending",
+              assigned_to: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
+              since: new Date(),
+            };
+            job.workflow_stages.push({
+              stage: "quality_check",
+              stage_label: "Quality Check",
+              handled_by: job.qc_assignee || { user_id: job.created_by_admin_id, name: job.created_by, role: "creator" },
+              assigned_by: { user_id: null, name: "Pickup Delivery" },
+              action: "assigned",
+              assigned_at: new Date(),
+              notes: `Outsource pickup delivered by ${received_by || "staff"}. Job forwarded to Quality Check.`,
+            });
+            await job.save();
+          }
+        } catch (jobErr) {
+          console.error("Error updating job stage on pickup delivery:", jobErr);
+        }
+      }
     }
 
     await issue.save();

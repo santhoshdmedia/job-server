@@ -64,7 +64,7 @@ const userSchema = new mongoose.Schema(
     role: {
       type: String,
       default: "user",
-      enum: ["user", "Corporate", "Dealer","bni_user"],
+      enum: ["user", "Corporate", "Dealer", "bni_user"],
     },
     member_Name: {
       type: String,
@@ -106,13 +106,13 @@ const userSchema = new mongoose.Schema(
     },
     verified_by: {
       type: mongoose.Schema.Types.ObjectId,
-        ref: 'admin_users'
+      ref: 'admin_users'
     },
     Dealer_verification: {
       type: Boolean,
       default: false,
     },
-    wish_list: [], 
+    wish_list: [],
     history_data: [
       {
         type: mongoose.Schema.Types.ObjectId,

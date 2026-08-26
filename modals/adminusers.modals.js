@@ -59,6 +59,10 @@ module.exports = model(
         required: true,
       },
       pagePermissions: [pagePermissionSchema],
+      actionPermissions: {
+        type: [String],
+        default: [],
+      },
       available: {
         type: Boolean,
         default: true,

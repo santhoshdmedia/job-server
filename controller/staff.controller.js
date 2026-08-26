@@ -61,7 +61,7 @@ const getSingleStaff = async (req, res) => {
 // POST /api/staff
 const createStaff = async (req, res) => {
   try {
-    const { name, email, phone, password, role, profileImg, pagePermissions, staff_category, working_hours_per_day, salary } = req.body;
+    const { name, email, phone, password, role, profileImg, pagePermissions, actionPermissions, staff_category, working_hours_per_day, salary } = req.body;
 
     if (!name || !email || !phone || !password || !role)
       return err(res, "name, email, phone, password and role are required", 400);
@@ -79,6 +79,7 @@ const createStaff = async (req, res) => {
       role,
       profileImg: profileImg || "",
       pagePermissions: pagePermissions || [],
+      actionPermissions: actionPermissions || [],
       staff_category: staff_category === "marketing" ? "marketing" : "office",
       // Custom working hours (default 10/day) and manually-entered salary.
       working_hours_per_day: working_hours_per_day && Number(working_hours_per_day) > 0 ? Number(working_hours_per_day) : 10,
@@ -146,16 +147,19 @@ const toggleAvailable = async (req, res) => {
   }
 };
 
-// ─── UPDATE page permissions ──────────────────────────────────────────────────
-// PATCH /api/staff/:id/permissions
 const updatePermissions = async (req, res) => {
   try {
-    const { pagePermissions } = req.body;
-    if (!Array.isArray(pagePermissions))
-      return err(res, "pagePermissions must be an array", 400);
+    const { pagePermissions, actionPermissions } = req.body;
+    const update = {};
+    if (Array.isArray(pagePermissions)) {
+      update.pagePermissions = pagePermissions;
+    }
+    if (Array.isArray(actionPermissions)) {
+      update.actionPermissions = actionPermissions;
+    }
 
     const updated = await AdminUser
-      .findByIdAndUpdate(req.params.id, { pagePermissions }, { new: true })
+      .findByIdAndUpdate(req.params.id, update, { new: true })
       .select("-password")
       .lean();
 

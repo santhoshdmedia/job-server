@@ -16,7 +16,7 @@ const GenerateToken = async (payload) => {
   return jwt.sign(payload, process.env.SECRET_KEY);
 };
 
-// Authenticates admin users (AdminUsersSchema).
+// Authenticates admin / staff users.
 // Checks token validity and that the user exists and is not deactivated.
 const authenticate = async (req, res, next) => {
   try {
@@ -33,14 +33,29 @@ const authenticate = async (req, res, next) => {
       return errorResponse(res, "Invalid token", 401);
     }
 
-    const user = await AdminUsersSchema.findById(decoded.id).lean();
+    const userId = decoded.id || decoded._id || decoded.userId;
+    let user = null;
+
+    if (userId) {
+      user = await AdminUsersSchema.findById(userId).lean();
+    }
+    if (!user && decoded.email) {
+      user = await AdminUsersSchema.findOne({ email: decoded.email }).lean();
+    }
+    if (!user && userId) {
+      const { UserSchema } = require("../controller/models_import");
+      user = await UserSchema.findById(userId).lean();
+    }
+    if (!user && decoded.email) {
+      const { UserSchema } = require("../controller/models_import");
+      user = await UserSchema.findOne({ email: decoded.email }).lean();
+    }
 
     if (!user) {
       return errorResponse(res, "User not found", 401);
     }
 
     // Use `available` field (the actual field in AdminUsersSchema).
-    // `isActive` does not exist — checking it would block every user.
     if (user.available === false) {
       return errorResponse(res, "Account is deactivated", 401);
     }

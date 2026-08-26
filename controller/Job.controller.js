@@ -77,17 +77,27 @@ exports.createJob = async (req, res) => {
       payments, design_charges,
       valid_until, notes, terms_and_conditions, created_by,
       created_by_admin_id, site_visit_id, site_visit_no, site_visit_photos,
+      material_needed, delivery_mode,
     } = req.body;
+
+    const user = req.user || {};
+    const creatorId   = user._id || user.user_id || created_by_admin_id || null;
+    const creatorName = user.name || created_by || "Admin";
+    const creatorRole = user.role || "admin";
 
     const job_no = await generateJobNo();
 
     const processedItems = (cart_items || []).map((item) => ({
       ...item,
       item_id: item.item_id || new mongoose.Types.ObjectId().toHexString(),
+      production_type: item.production_type || item.printing_type || "",
+      other_process_type: item.other_process_type || "",
       design_files: item.design_files || [],
       design_status: item.design_status || "pending",
       designers: item.designers || [],
     }));
+
+    const now = new Date();
 
     // Build the job WITHOUT payments first. total_amount must be set
     // before we call addPayment(), since it validates amount against
@@ -98,12 +108,15 @@ exports.createJob = async (req, res) => {
       customer_name: customer_name || "",
       customer_phone: customer_phone || "",
       company_name: company_name || "",
-      order_date: order_date ? new Date(order_date) : null,
+      order_date: order_date ? new Date(order_date) : now,
       estimated_delivery_date: estimated_delivery_date ? new Date(estimated_delivery_date) : null,
       cart_items: processedItems,
       delivery_address: delivery_address || {},
-      job_status: job_status || "draft",
-      status_updated_at: new Date(),
+      job_status: job_status || "pending_approval",
+      job_approval_status: "pending",
+      material_needed: material_needed !== undefined ? Boolean(material_needed) : true,
+      delivery_mode: delivery_mode || "",
+      status_updated_at: now,
       subtotal: parseFloat(subtotal) || 0,
       discount_percentage: parseFloat(discount_percentage) || 0,
       discount_amount: parseFloat(discount_amount) || 0,
@@ -114,11 +127,39 @@ exports.createJob = async (req, res) => {
       total_amount: parseFloat(total_amount),
       gst_no: gst_no || "",
       design_charges: parseFloat(design_charges) || 0,
-      valid_until: new Date(valid_until),
+      valid_until: valid_until ? new Date(valid_until) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       notes: notes || "",
       terms_and_conditions: terms_and_conditions || "",
-      created_by: created_by || "admin",
-      created_by_admin_id: created_by_admin_id || null,
+      created_by: creatorName,
+      created_by_admin_id: creatorId,
+      qc_assignee: {
+        user_id: creatorId,
+        name: creatorName,
+        role: creatorRole,
+      },
+      delivery_mode_set_by: {
+        user_id: creatorId,
+        name: creatorName,
+        role: creatorRole,
+      },
+      workflow_stages: [
+        {
+          stage: "job_created",
+          stage_label: "Job Created",
+          handled_by: { user_id: creatorId, name: creatorName, role: creatorRole },
+          assigned_by: { user_id: creatorId, name: creatorName },
+          action: "pending_approval",
+          assigned_at: now,
+          notes: "Job created and pending approval by authorized staff.",
+        },
+      ],
+      current_stage: {
+        stage: "job_approval",
+        stage_label: "Pending Approval",
+        stage_action: "pending",
+        assigned_to: { user_id: creatorId, name: creatorName, role: creatorRole },
+        since: now,
+      },
       converted_to_order: false,
       deletedAt: null,
       site_visit_id: site_visit_id || null,
@@ -126,13 +167,9 @@ exports.createJob = async (req, res) => {
       site_visit_photos: site_visit_photos || [],
     });
 
-    // Record any initial payment(s) through the schema's own addPayment()
-    // helper, so amount-vs-balance validation, the balance_after snapshot,
-    // and the cached payment_amount/balance_amount/next_due_date fields
-    // are all computed correctly — never trusted directly from the client.
     const collectedBy = {
-      user_id: created_by_admin_id || null,
-      name:    created_by || "Admin",
+      user_id: creatorId,
+      name:    creatorName,
     };
 
     for (const p of payments || []) {
@@ -411,6 +448,7 @@ exports.approveJob = async (req, res) => {
     const now = new Date();
     job.approved_by          = approved_by;
     job.approved_by_admin_id = approved_by_admin_id;
+    job.job_approval_status  = "approved";
     job.status_updated_at    = now;
 
     // ── Branch: Customer-designed vs. Internal designer ───────────────────
@@ -486,6 +524,7 @@ exports.approveJob = async (req, res) => {
     return resp(res, 500, false, err.message);
   }
 };
+
 
 exports.assignJob = async (req, res) => {
   try {
@@ -1386,3 +1425,679 @@ exports.collectPayment = async (req, res) => {
     return res.status(400).json({ success: false, message: err.message || "Failed to record payment" });
   }
 };
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * NEW METHODS FOR JOB CONTROLLER
+ * Add these methods to the existing Job.controller.js file
+ * ════════════════════════════════════════════════════════════════════════════
+ * 
+ * These methods handle:
+ * 1. Getting design files for production panel
+ * 2. Getting delivery details for delivery panel
+ * 3. Collecting payments during delivery
+ */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESPONSE HELPER (should already exist in your controller)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. GET DESIGN FILES FOR PRODUCTION PANEL
+// GET /api/jobs/:jobId/design-files
+// 
+// Returns all design files grouped by cart item, formatted for the production
+// staff to download and use for manufacturing.
+// 
+// Response format:
+// {
+//   success: true,
+//   message: "Design files retrieved",
+//   data: [
+//     {
+//       item_id: "...",
+//       item_name: "...",
+//       item_sku: "...",
+//       item_category: "...",
+//       design_files: [ { _id, url, file_name, label, caption, ... } ]
+//     }
+//   ]
+// }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getDesignFilesForProduction = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    const job = await Job.findById(jobId)
+      .select("job_no job_status cart_items")
+      .lean();
+
+    if (!job) {
+      return resp(res, 404, false, "Job not found");
+    }
+
+    // Check if job is in production or later stage
+    const productionStatuses = ["production", "qc", "ready", "delivered", "completed"];
+    if (!productionStatuses.includes(job.job_status)) {
+      return resp(res, 403, false, "Job must be in production stage to view design files");
+    }
+
+    // Format design files by item
+    const designFilesGrouped = job.cart_items.map((item) => ({
+      item_id: item._id?.toString() || item.item_id,
+      item_name: item.item_name || "",
+      item_sku: item.item_sku || "",
+      item_category: item.item_category || "",
+      quantity: item.quantity || 0,
+      unit: item.unit || "",
+      design_files: (item.design_files || []).map((file) => ({
+        _id: file._id?.toString(),
+        url: file.url,
+        file_name: file.file_name,
+        file_type: file.file_type,
+        label: file.label,
+        caption: file.caption,
+        uploaded_at: file.uploaded_at,
+        uploaded_by: {
+          user_id: file.uploaded_by?.user_id?.toString() || "",
+          name: file.uploaded_by?.name || "",
+        },
+        work_status: file.work_status || "pending",
+        work_notes: file.work_notes || "",
+        approved_at: file.approved_at || null,
+        rejection_reason: file.rejection_reason || "",
+      })),
+    }));
+
+    return resp(
+      res,
+      200,
+      true,
+      "Design files retrieved successfully",
+      designFilesGrouped
+    );
+  } catch (error) {
+    console.error("❌ getDesignFilesForProduction", error);
+    return resp(res, 500, false, error.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. GET DELIVERY DETAILS FOR DELIVERY PANEL
+// GET /api/jobs/:jobId/delivery-details
+// 
+// Returns all delivery and payment information needed by delivery staff.
+// Delivery details are READ-ONLY (set at job creation).
+// Payments can be updated via collectPayment endpoint.
+// 
+// Response format:
+// {
+//   success: true,
+//   message: "Delivery details retrieved",
+//   data: {
+//     job_no: "DM0001",
+//     customer_name: "...",
+//     customer_phone: "...",
+//     delivery_address: { street, city, state, pincode, country },
+//     estimated_delivery_date: "2024-01-20",
+//     delivery_mode: "Home Delivery",
+//     delivery_charges: 500,
+//     free_delivery: false,
+//     total_amount: 50000,
+//     payment_amount: 30000,
+//     balance_amount: 20000,
+//     next_due_date: "2024-01-25",
+//     payments: [ { _id, amount, method, paid_at, collected_by, notes } ]
+//   }
+// }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getDeliveryDetails = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    const job = await Job.findById(jobId)
+      .select(
+        "job_no job_status customer_name customer_phone delivery_address " +
+        "estimated_delivery_date delivery_mode delivery_payment_mode is_credit " +
+        "credit_details delivery_assigned_to delivery_notes delivery_status " +
+        "delivery_charges free_delivery total_amount payment_amount balance_amount " +
+        "next_due_date payments receiver_name tracking_no delivery_photos"
+      )
+      .populate("payments.collected_by.user_id", "name role email")
+      .populate("credit_details.approved_by.user_id", "name role")
+      .populate("delivery_assigned_to.user_id", "name role")
+      .lean();
+
+    if (!job) {
+      return resp(res, 404, false, "Job not found");
+    }
+
+    // Format delivery details response
+    const data = {
+      _id: job._id?.toString(),
+      job_no: job.job_no,
+      job_status: job.job_status,
+      customer_name: job.customer_name,
+      customer_phone: job.customer_phone,
+      delivery_address: {
+        street: job.delivery_address?.street || "",
+        city: job.delivery_address?.city || "",
+        state: job.delivery_address?.state || "",
+        pincode: job.delivery_address?.pincode || "",
+        country: job.delivery_address?.country || "India",
+      },
+      estimated_delivery_date: job.estimated_delivery_date,
+      delivery_mode: job.delivery_mode || "Not Specified",
+      delivery_payment_mode: job.delivery_payment_mode || (job.is_credit ? "Credit" : "Cash"),
+      is_credit: !!job.is_credit,
+      credit_details: job.credit_details || null,
+      delivery_assigned_to: job.delivery_assigned_to || null,
+      delivery_notes: job.delivery_notes || "",
+      delivery_status: job.delivery_status || "pending",
+      receiver_name: job.receiver_name || "",
+      tracking_no: job.tracking_no || "",
+      delivery_photos: job.delivery_photos || [],
+      delivery_charges: job.delivery_charges || 0,
+      free_delivery: job.free_delivery || false,
+      total_amount: job.total_amount || 0,
+      payment_amount: job.payment_amount || 0,
+      balance_amount: job.balance_amount || 0,
+      next_due_date: job.next_due_date || null,
+      payments: (job.payments || []).map((payment) => ({
+        _id: payment._id?.toString(),
+        amount: payment.amount,
+        method: payment.method,
+        paid_at: payment.paid_at,
+        balance_after: payment.balance_after || 0,
+        collected_by: {
+          user_id: payment.collected_by?.user_id?.toString() || "",
+          name: payment.collected_by?.name || "",
+        },
+        notes: payment.notes || "",
+      })),
+    };
+
+    return resp(
+      res,
+      200,
+      true,
+      "Delivery details retrieved successfully",
+      data
+    );
+  } catch (error) {
+    console.error("❌ getDeliveryDetails", error);
+    return resp(res, 500, false, error.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. COLLECT PAYMENT DURING DELIVERY
+// POST /api/jobs/:jobId/collect-payment
+// ─────────────────────────────────────────────────────────────────────────────
+exports.collectPaymentDelivery = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { amount, method, notes = "", delivery_notes = "" } = req.body;
+
+    // Get user info from request (should be attached by auth middleware)
+    const userId = req.user?.user_id || req.user?._id || null;
+    const userName = req.user?.name || "Unknown";
+    const userRole = req.user?.role || "";
+
+    // ─── VALIDATION ───────────────────────────────────────────────────────────
+    if (!amount || typeof amount !== "number") {
+      return resp(res, 400, false, "Amount must be a valid number");
+    }
+
+    if (amount <= 0) {
+      return resp(res, 400, false, "Amount must be greater than 0");
+    }
+
+    if (!method || typeof method !== "string") {
+      return resp(res, 400, false, "Payment method is required");
+    }
+
+    // ─── FETCH JOB ─────────────────────────────────────────────────────────────
+    const job = await Job.findById(jobId);
+
+    if (!job) {
+      return resp(res, 404, false, "Job not found");
+    }
+
+    // ─── VALIDATE AMOUNT ──────────────────────────────────────────────────────
+    if (amount > job.balance_amount + 0.01) {
+      return resp(
+        res,
+        400,
+        false,
+        `Payment amount ₹${amount} exceeds remaining balance ₹${job.balance_amount}`
+      );
+    }
+
+    // ─── ADD PAYMENT ───────────────────────────────────────────────────────────
+    if (typeof job.addPayment === "function") {
+      job.addPayment({
+        amount,
+        method,
+        notes,
+        collected_by: {
+          user_id: userId,
+          name: userName,
+        },
+      });
+    } else {
+      const newPayment = {
+        amount,
+        method,
+        paid_at: new Date(),
+        notes,
+        collected_by: {
+          user_id: userId,
+          name: userName,
+        },
+        balance_after: Math.max(0, job.balance_amount - amount),
+      };
+
+      if (!job.payments) job.payments = [];
+      job.payments.push(newPayment);
+
+      job.payment_amount = (job.payment_amount || 0) + amount;
+      job.balance_amount = Math.max(0, (job.total_amount || 0) - job.payment_amount);
+    }
+
+    // ─── UPDATE DELIVERY NOTES ────────────────────────────────────────────────
+    if (delivery_notes) {
+      job.delivery_notes = (job.delivery_notes || "") + "\n" + delivery_notes;
+    }
+
+    // ─── SAVE JOB ──────────────────────────────────────────────────────────────
+    await job.save();
+
+    // ─── RESPONSE ──────────────────────────────────────────────────────────────
+    const lastPayment = job.payments[job.payments.length - 1];
+
+    return resp(res, 200, true, "Payment collected successfully", {
+      payment_id: lastPayment._id?.toString(),
+      payment_amount: amount,
+      method: method,
+      paid_at: lastPayment.paid_at,
+      total_amount: job.total_amount,
+      payment_amount_total: job.payment_amount,
+      balance_amount: job.balance_amount,
+      next_due_date: job.next_due_date || null,
+      job_status: job.job_status,
+      is_credit: job.is_credit,
+    });
+  } catch (error) {
+    console.error("❌ collectPaymentDelivery", error);
+    return resp(res, 500, false, error.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. SET DELIVERY MODE (AFTER PRODUCTION & PAYMENT PROCESSING)
+// POST /api/jobs/:id/set-delivery-mode
+// ─────────────────────────────────────────────────────────────────────────────
+exports.setDeliveryMode = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      delivery_mode,
+      delivery_payment_mode = "Cash",
+      is_credit = false,
+      credit_notes = "",
+      credit_due_date = null,
+      payment = null,
+      assigned_to = null,
+      handled_by = {},
+      notes = "",
+    } = req.body;
+
+    if (!delivery_mode) {
+      return resp(res, 400, false, "Delivery mode is required.");
+    }
+
+    const job = await Job.findById(id);
+    if (!job) {
+      return resp(res, 404, false, "Job not found.");
+    }
+
+    const now = new Date();
+    const adminUser = req.user || handled_by || {};
+
+    // 1. Process payment if immediate collection provided
+    if (payment && parseFloat(payment.amount) > 0) {
+      const pAmt = parseFloat(payment.amount);
+      job.addPayment({
+        amount: pAmt,
+        method: payment.method || delivery_payment_mode || "Cash",
+        notes: payment.notes || "Collected at delivery mode setting",
+        collected_by: {
+          user_id: adminUser.user_id || adminUser._id || null,
+          name: adminUser.name || "Staff",
+        },
+      });
+    }
+
+    // 2. Set Credit details if credit mode selected or requested
+    const isCreditMode = is_credit === true || delivery_payment_mode === "Credit";
+    if (isCreditMode) {
+      job.is_credit = true;
+      job.delivery_payment_mode = "Credit";
+      job.credit_details = {
+        approved_by: {
+          user_id: adminUser.user_id || adminUser._id || null,
+          name: adminUser.name || "Authorized Staff",
+          role: adminUser.role || "admin",
+        },
+        approved_at: now,
+        credit_amount: job.balance_amount || 0,
+        due_date: credit_due_date ? new Date(credit_due_date) : null,
+        notes: credit_notes || notes || "Credit approved for delivery without immediate payment.",
+      };
+      if (credit_due_date) {
+        job.next_due_date = new Date(credit_due_date);
+      }
+    } else {
+      job.is_credit = false;
+      job.delivery_payment_mode = delivery_payment_mode;
+    }
+
+    // 3. Set Delivery Mode & Assignment
+    job.delivery_mode = delivery_mode;
+    if (assigned_to?.name) {
+      job.delivery_assigned_to = {
+        user_id: assigned_to.user_id || null,
+        name: assigned_to.name || "",
+        role: assigned_to.role || "delivery team",
+      };
+    }
+
+    if (notes) {
+      job.delivery_notes = (job.delivery_notes ? job.delivery_notes + "\n" : "") + notes;
+    }
+
+    job.delivery_status = "ready_for_delivery";
+    job.job_status = "delivery";
+    job.status_updated_at = now;
+
+    // 4. Update workflow stages
+    const stageEntry = {
+      stage: "delivery",
+      stage_label: `Delivery (${delivery_mode})`,
+      handled_by: {
+        user_id: assigned_to?.user_id || adminUser.user_id || adminUser._id || null,
+        name: assigned_to?.name || adminUser.name || "Delivery Team",
+        role: assigned_to?.role || "delivery team",
+      },
+      assigned_by: {
+        user_id: adminUser.user_id || adminUser._id || null,
+        name: adminUser.name || "Admin",
+      },
+      action: "assigned",
+      assigned_at: now,
+      started_at: null,
+      completed_at: null,
+      work_sessions: [],
+      notes: notes || `Delivery mode set to "${delivery_mode}" with payment mode "${job.delivery_payment_mode}".`,
+    };
+
+    job.workflow_stages.push(stageEntry);
+    job.current_stage = {
+      stage: "delivery",
+      stage_label: `Delivery (${delivery_mode})`,
+      stage_action: "assigned",
+      assigned_to: stageEntry.handled_by,
+      since: now,
+    };
+
+    await job.save();
+
+    return resp(res, 200, true, `Delivery mode set to "${delivery_mode}" successfully.`, toPlain(job));
+  } catch (error) {
+    console.error("❌ setDeliveryMode", error);
+    return resp(res, 500, false, error.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. GET PAYMENT HISTORY
+// GET /api/jobs/:jobId/payment-history
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getPaymentHistory = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    const job = await Job.findById(jobId)
+      .select(
+        "job_no total_amount payment_amount balance_amount " +
+        "next_due_date is_credit credit_details payments"
+      )
+      .populate("payments.collected_by.user_id", "name role email")
+      .lean();
+
+    if (!job) {
+      return resp(res, 404, false, "Job not found");
+    }
+
+    const data = {
+      job_no: job.job_no,
+      total_amount: job.total_amount,
+      payment_amount: job.payment_amount,
+      balance_amount: job.balance_amount,
+      next_due_date: job.next_due_date,
+      is_credit: !!job.is_credit,
+      credit_details: job.credit_details || null,
+      payments: (job.payments || []).map((payment) => ({
+        _id: payment._id?.toString(),
+        amount: payment.amount,
+        method: payment.method,
+        paid_at: payment.paid_at,
+        balance_after: payment.balance_after || 0,
+        collected_by: {
+          user_id: payment.collected_by?.user_id?.toString() || "",
+          name: payment.collected_by?.name || "",
+        },
+        notes: payment.notes || "",
+      })),
+    };
+
+    return resp(res, 200, true, "Payment history retrieved", data);
+  } catch (error) {
+    console.error("❌ getPaymentHistory", error);
+    return resp(res, 500, false, error.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. SET MATERIAL NEEDED (STORE MANAGER WORKFLOW)
+// PATCH /api/jobs/:id/material-needed
+// ─────────────────────────────────────────────────────────────────────────────
+exports.setMaterialNeeded = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { material_needed = false, notes = "" } = req.body;
+    const user = req.user || {};
+
+    const job = await Job.findById(id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    const now = new Date();
+    job.material_needed = Boolean(material_needed);
+    job.status_updated_at = now;
+
+    if (!job.material_needed) {
+      job.job_status = "production";
+      job.workflow_stages.push({
+        stage: "production",
+        stage_label: "Production",
+        handled_by: {
+          user_id: user._id || user.user_id || null,
+          name: user.name || "Store Manager",
+          role: user.role || "store manager",
+        },
+        assigned_by: {
+          user_id: user._id || user.user_id || null,
+          name: user.name || "Store Manager",
+        },
+        action: "ready_for_production",
+        assigned_at: now,
+        notes: notes || "Material Needed set to OFF by Store Manager — forwarded to Production.",
+      });
+      job.current_stage = {
+        stage: "production",
+        stage_label: "Production (Direct)",
+        stage_action: "ready_for_production",
+        assigned_to: { user_id: null, name: "Production Floor", role: "production team" },
+        since: now,
+      };
+    }
+
+    await job.save();
+    return resp(
+      res,
+      200,
+      true,
+      `Material requirement set to ${job.material_needed ? "ON" : "OFF"}.`,
+      toPlain(job)
+    );
+  } catch (err) {
+    console.error("setMaterialNeeded ❌", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. COMPLETE FINAL DELIVERY & ARCHIVE JOB (DEDICATED PANEL)
+// POST /api/jobs/:id/complete-delivery
+// ─────────────────────────────────────────────────────────────────────────────
+exports.completeJobDelivery = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      delivery_method,
+      tracking_no = "",
+      courier_name = "",
+      receiver_name = "",
+      receiver_phone = "",
+      delivery_date = null,
+      delivery_notes = "",
+      payment_status = "",
+      credit_amount = 0,
+      photos = [],
+    } = req.body;
+
+    const user = req.user || {};
+    const job = await Job.findById(id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    const now = new Date();
+    job.final_delivery = {
+      status: "completed",
+      delivery_method: delivery_method || job.delivery_mode || "Delivered",
+      tracking_no: tracking_no || job.tracking_no || "",
+      courier_name: courier_name || "",
+      receiver_name: receiver_name || job.receiver_name || "",
+      receiver_phone: receiver_phone || "",
+      delivery_date: delivery_date ? new Date(delivery_date) : now,
+      delivery_notes: delivery_notes || job.delivery_notes || "",
+      payment_status: payment_status || (job.balance_amount <= 0 ? "paid" : job.is_credit ? "credit" : "partial"),
+      credit_amount: credit_amount || (job.is_credit ? job.balance_amount : 0),
+      delivered_by: {
+        user_id: user._id || user.user_id || null,
+        name: user.name || "Delivery Staff",
+      },
+      photos: Array.isArray(photos) && photos.length ? photos : job.delivery_photos || [],
+      completed_at: now,
+    };
+
+    job.delivery_status = "delivered";
+    job.job_status = "completed";
+    job.status_updated_at = now;
+
+    job.workflow_stages.push({
+      stage: "completed",
+      stage_label: "Job Completed",
+      handled_by: {
+        user_id: user._id || user.user_id || null,
+        name: user.name || "Delivery Staff",
+        role: user.role || "delivery team",
+      },
+      assigned_by: {
+        user_id: user._id || user.user_id || null,
+        name: user.name || "Delivery Staff",
+      },
+      action: "completed",
+      assigned_at: now,
+      started_at: now,
+      completed_at: now,
+      work_sessions: [],
+      notes: delivery_notes || `Final delivery completed via ${delivery_method || "Delivered"}. Job marked as completed.`,
+    });
+
+    job.current_stage = {
+      stage: "completed",
+      stage_label: "Completed",
+      stage_action: "completed",
+      assigned_to: { user_id: null, name: "—", role: "" },
+      since: now,
+    };
+
+    await job.save();
+    return resp(res, 200, true, "Delivery completed and job marked as Completed.", toPlain(job));
+  } catch (err) {
+    console.error("completeJobDelivery ❌", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+exports.assignQC = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { assigned_to, assigned_by, notes } = req.body;
+
+    if (!assigned_to?.user_id) {
+      return resp(res, 400, false, "QC assignee is required.");
+    }
+
+    const job = await Job.findById(id);
+    if (!job) return resp(res, 404, false, "Job not found.");
+
+    const now = new Date();
+    job.qc_assignee = {
+      user_id: assigned_to.user_id,
+      name: assigned_to.name || "QC Staff",
+      role: assigned_to.role || "quality check",
+    };
+
+    if (job.job_status === "quality_check" || req.body.update_stage) {
+      job.current_stage = {
+        stage: "quality_check",
+        stage_label: "Quality Check",
+        stage_action: "assigned",
+        assigned_to: job.qc_assignee,
+        since: now,
+      };
+    }
+
+    job.workflow_stages.push({
+      stage: "quality_check",
+      stage_label: "Quality Check",
+      handled_by: job.qc_assignee,
+      assigned_by: typeof assigned_by === "object" ? assigned_by : { user_id: req.user?._id || null, name: assigned_by || req.user?.name || "Admin" },
+      action: "reassigned",
+      assigned_at: now,
+      notes: notes || `Quality Check assigned to ${assigned_to.name || "staff"}`,
+    });
+
+    await job.save();
+    return resp(res, 200, true, `Quality Check assigned to ${assigned_to.name || "staff"}.`, { job: toPlain(job) });
+  } catch (err) {
+    console.error("❌ assignQC error:", err);
+    return resp(res, 500, false, err.message);
+  }
+};
+
+
+
+
+

@@ -298,6 +298,10 @@ const jobCartItemSchema = new Schema(
 
     // ── Per-item designer assignments (supports multiple) ─────────────────
     designers: { type: [itemDesignerAssignmentSchema], default: [] },
+
+    // ── File / Production Type & Custom other flow ────────────────────────
+    production_type:    { type: String, default: "" }, // "Print File" | "Cutting File" | "Print & Cut" | "Trimcap" | "Engraving" | "Other"
+    other_process_type: { type: String, default: "" },
   },
   { _id: true },
 );
@@ -320,8 +324,29 @@ const jobSchema = new Schema(
     estimated_delivery_date: { type: Date },
     order_date:              { type: Date },
 
-    job_status:        { type: String, default: "draft" },
+    job_status:        { type: String, default: "pending_approval" },
     status_updated_at: { type: Date },
+
+    // ── Job Approval & Material Requirement Flags ─────────────────────────
+    job_approval_status: {
+      type:    String,
+      enum:    ["pending", "approved", "rejected"],
+      default: "pending",
+      index:   true,
+    },
+    material_needed: { type: Boolean, default: true },
+
+    // ── Automatic Assignee References ─────────────────────────────────────
+    qc_assignee: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+    delivery_mode_set_by: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
 
     // ── Live snapshot ──────────────────────────────────────────────────────
     current_stage: {
@@ -402,6 +427,52 @@ const jobSchema = new Schema(
 
     converted_to_order: { type: Boolean, default: false },
     converted_at:       { type: Date },
+
+    // ── Delivery & Payment Mode Workflow ───────────────────────────────────
+    delivery_mode:         { type: String, default: "" },
+    delivery_payment_mode: { type: String, default: "" },
+    is_credit:             { type: Boolean, default: false },
+    credit_details: {
+      approved_by: {
+        user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+        name:    { type: String, default: "" },
+        role:    { type: String, default: "" },
+      },
+      approved_at:   { type: Date, default: null },
+      credit_amount: { type: Number, default: 0 },
+      due_date:      { type: Date, default: null },
+      notes:         { type: String, default: "" },
+    },
+    delivery_assigned_to: {
+      user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+      name:    { type: String, default: "" },
+      role:    { type: String, default: "" },
+    },
+    delivery_notes:   { type: String, default: "" },
+    delivery_status:  { type: String, default: "pending" },
+    receiver_name:    { type: String, default: "" },
+    tracking_no:      { type: String, default: "" },
+    delivery_photos:  { type: [String], default: [] },
+
+    // ── Final Dedicated Completion Snapshot ────────────────────────────────
+    final_delivery: {
+      status:          { type: String, default: "pending" },
+      delivery_method: { type: String, default: "" },
+      tracking_no:     { type: String, default: "" },
+      courier_name:    { type: String, default: "" },
+      receiver_name:   { type: String, default: "" },
+      receiver_phone:  { type: String, default: "" },
+      delivery_date:   { type: Date,   default: null },
+      delivery_notes:  { type: String, default: "" },
+      payment_status:  { type: String, default: "" },
+      credit_amount:   { type: Number, default: 0 },
+      delivered_by: {
+        user_id: { type: Schema.Types.ObjectId, ref: "admin_users", default: null },
+        name:    { type: String, default: "" },
+      },
+      photos:       { type: [String], default: [] },
+      completed_at: { type: Date,     default: null },
+    },
 
     // ── Soft delete ────────────────────────────────────────────────────────
     deletedAt:     { type: Date,   default: null },
